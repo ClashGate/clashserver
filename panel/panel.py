@@ -11,6 +11,7 @@ Subcommands:
 """
 import argparse
 import base64
+import calendar
 import hashlib
 import hmac
 import html
@@ -332,73 +333,154 @@ def mihomo_status() -> dict:
 
 # ---------------------------------------------------------------- HTTP
 CSS = """
-:root{--bg:#f4f6fb;--card:#fff;--text:#1f2937;--muted:#6b7280;--line:#e5e7eb;--primary:#2563eb;
---primary-h:#1d4ed8;--ok:#16a34a;--ok-bg:#dcfce7;--bad:#dc2626;--bad-bg:#fee2e2;--warn:#b45309;--warn-bg:#fef3c7;
---radius:12px;--shadow:0 1px 2px rgba(16,24,40,.05),0 1px 3px rgba(16,24,40,.08)}
+:root{--bg:#f3f5f9;--card:#fff;--text:#111827;--muted:#6b7280;--faint:#9ca3af;--line:#e8ebf0;
+--primary:#4f46e5;--primary-h:#4338ca;--primary-soft:#eef2ff;--ok:#15803d;--ok-bg:#dcfce7;--bad:#b91c1c;
+--bad-bg:#fee2e2;--warn:#b45309;--warn-bg:#fef3c7;--radius:14px;
+--shadow:0 1px 2px rgba(16,24,40,.04),0 4px 16px rgba(16,24,40,.06)}
 *{box-sizing:border-box}
-body{margin:0;background:var(--bg);color:var(--text);font:14px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",
-"PingFang SC","Hiragino Sans GB","Microsoft YaHei","Noto Sans CJK SC",sans-serif}
-.topbar{background:var(--card);border-bottom:1px solid var(--line)}
-.topbar .in{max-width:1080px;margin:0 auto;padding:14px 20px;display:flex;align-items:center;gap:12px}
-.brand{font-weight:700;font-size:17px}.brand span{color:var(--primary)}
-.host{color:var(--muted)}.spacer{flex:1}
-main{max-width:1080px;margin:0 auto;padding:24px 20px 48px}
-.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:20px}
+html{-webkit-text-size-adjust:100%}
+body{margin:0;background:var(--bg);color:var(--text);font:14px/1.65 -apple-system,BlinkMacSystemFont,"PingFang SC",
+"Hiragino Sans GB","Microsoft YaHei","Noto Sans CJK SC","Segoe UI",sans-serif;-webkit-font-smoothing:antialiased}
+a{color:var(--primary);text-decoration:none}
+.topbar{background:rgba(255,255,255,.9);backdrop-filter:blur(8px);border-bottom:1px solid var(--line);
+position:sticky;top:0;z-index:10}
+.topbar .in{max-width:1120px;margin:0 auto;padding:12px 24px;display:flex;align-items:center;gap:14px}
+.logo{width:34px;height:34px;border-radius:10px;background:linear-gradient(135deg,#6366f1,#8b5cf6);color:#fff;
+display:flex;align-items:center;justify-content:center;font-weight:800;font-size:16px;flex:none;
+box-shadow:0 4px 10px rgba(99,102,241,.35)}
+.brand{display:flex;flex-direction:column;line-height:1.25}.brand b{font-size:16px;letter-spacing:.2px}
+.brand small{color:var(--muted);font-size:12px}
+.chip{display:inline-flex;align-items:center;gap:6px;background:#f3f4f6;color:#374151;border-radius:999px;
+padding:3px 12px;font-size:12px}
+.dot{width:8px;height:8px;border-radius:50%;background:var(--faint);display:inline-block}
+.dot.ok{background:#22c55e;box-shadow:0 0 0 3px #dcfce7}.dot.bad{background:#ef4444;box-shadow:0 0 0 3px #fee2e2}
+.dot.warn{background:#f59e0b;box-shadow:0 0 0 3px #fef3c7}
+.spacer{flex:1}
+main{max-width:1120px;margin:0 auto;padding:28px 24px 56px}
+.page-h{display:flex;align-items:flex-end;justify-content:space-between;gap:12px;margin:0 0 20px;flex-wrap:wrap}
+.page-h h1{font-size:22px;margin:0;font-weight:700}.page-h p{margin:2px 0 0;color:var(--muted)}
+.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:16px;margin-bottom:20px}
+.stat{background:var(--card);border:1px solid var(--line);border-radius:var(--radius);box-shadow:var(--shadow);
+padding:16px 18px}
+.stat .lb{color:var(--muted);font-size:12px;display:flex;align-items:center;gap:6px}
+.stat .val{font-size:22px;font-weight:700;margin-top:4px;line-height:1.3;word-break:break-all}
+.stat .val small{font-size:13px;font-weight:500;color:var(--muted);margin-left:4px}
+.stat .sub{font-size:12px;color:var(--faint);margin-top:2px}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(340px,1fr));gap:20px;margin-bottom:20px}
 .card{background:var(--card);border:1px solid var(--line);border-radius:var(--radius);box-shadow:var(--shadow);
-padding:20px 22px;margin-bottom:20px}
-.grid .card{margin-bottom:0}.grid{margin-bottom:20px}
-.card h2{font-size:15px;margin:0 0 14px;display:flex;align-items:center;gap:8px}
-.kv{display:grid;grid-template-columns:88px 1fr;row-gap:8px;margin:0 0 16px}
+padding:22px 24px;margin-bottom:20px}
+.grid .card{margin-bottom:0}
+.card-h{display:flex;align-items:center;gap:10px;margin:0 0 16px;flex-wrap:wrap}
+.card-h h2{font-size:16px;margin:0;font-weight:650}.card-h .desc{color:var(--muted);font-size:12px;width:100%;margin-top:-6px}
+.kv{display:grid;grid-template-columns:96px 1fr;row-gap:10px;margin:0 0 18px}
 .kv dt{color:var(--muted)}.kv dd{margin:0;word-break:break-all}
-.pill{display:inline-block;padding:1px 10px;border-radius:999px;font-size:12px;font-weight:600}
+.pill{display:inline-flex;align-items:center;gap:5px;padding:1px 10px;border-radius:999px;font-size:12px;font-weight:600;
+white-space:nowrap}
 .pill.ok{background:var(--ok-bg);color:var(--ok)}.pill.bad{background:var(--bad-bg);color:var(--bad)}
-.pill.warn{background:var(--warn-bg);color:var(--warn)}.pill.tag{background:#eef2ff;color:#4338ca}
-.btn{display:inline-flex;align-items:center;border:1px solid var(--line);background:#fff;color:var(--text);
-border-radius:8px;padding:7px 14px;font:inherit;cursor:pointer}
-.btn:hover{background:#f9fafb}.btn.primary{background:var(--primary);border-color:var(--primary);color:#fff}
-.btn.primary:hover{background:var(--primary-h)}.btn.danger{color:var(--bad)}.btn.danger:hover{background:var(--bad-bg)}
-.btn.sm{padding:3px 10px;font-size:12px}.row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
+.pill.warn{background:var(--warn-bg);color:var(--warn)}.pill.tag{background:var(--primary-soft);color:var(--primary-h)}
+.pill.gray{background:#f3f4f6;color:#4b5563}
+.k-vless-reality{background:#ede9fe;color:#6d28d9}.k-hysteria2{background:#e0f2fe;color:#0369a1}
+.k-snell{background:#dcfce7;color:#15803d}.k-trusttunnel{background:#ffedd5;color:#c2410c}
+.btn{display:inline-flex;align-items:center;justify-content:center;gap:6px;border:1px solid var(--line);background:#fff;
+color:var(--text);border-radius:9px;padding:8px 16px;font:inherit;font-weight:500;cursor:pointer;
+transition:background .15s,border-color .15s,box-shadow .15s}
+.btn:hover{background:#f9fafb;border-color:#d1d5db}
+.btn.primary{background:var(--primary);border-color:var(--primary);color:#fff;box-shadow:0 1px 2px rgba(79,70,229,.3)}
+.btn.primary:hover{background:var(--primary-h)}
+.btn.danger{color:var(--bad)}.btn.danger:hover{background:var(--bad-bg);border-color:#fecaca}
+.btn.ghost{border-color:transparent;background:transparent;color:var(--muted)}.btn.ghost:hover{background:#f3f4f6;color:var(--text)}
+.btn.sm{padding:4px 12px;font-size:12px;border-radius:8px}
+.row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
 form.inline{display:inline}
-.flash{border-radius:10px;padding:12px 16px;margin-bottom:20px;word-break:break-all}
-.flash.ok{background:var(--ok-bg);color:#14532d}.flash.bad{background:var(--bad-bg);color:#7f1d1d}
-table{width:100%;border-collapse:collapse}
-th{color:var(--muted);font-weight:500;font-size:12px;text-align:left;padding:8px 10px;border-bottom:1px solid var(--line)}
-td{padding:10px;border-bottom:1px solid var(--line);vertical-align:top}tr:last-child td{border-bottom:0}
-td.mono,code,pre{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
-pre{background:#0f172a;color:#e2e8f0;border-radius:8px;padding:12px;font-size:12px;white-space:pre-wrap;
-word-break:break-all;margin:8px 0 0}
-details summary{cursor:pointer;color:var(--primary);font-size:12px;display:inline}
-.muted{color:var(--muted)}.empty{color:var(--muted);text-align:center;padding:24px}
-.form-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:14px;margin-bottom:14px}
-label{display:block;font-size:12px;color:var(--muted);margin-bottom:4px}
-input,select{width:100%;padding:8px 10px;border:1px solid var(--line);border-radius:8px;font:inherit;background:#fff}
-input:focus,select:focus{outline:2px solid #bfdbfe;border-color:var(--primary)}
-.hint{font-size:12px;color:var(--muted);margin:12px 0 0}
-.login{max-width:380px;margin:12vh auto;padding:0 20px}
-.login .card{padding:28px}.login h1{font-size:20px;margin:0 0 4px}.login p.sub{color:var(--muted);margin:0 0 20px}
-.login .field{margin-bottom:14px}.login .btn{width:100%;justify-content:center;padding:10px}
-.err{background:var(--bad-bg);color:#7f1d1d;border-radius:8px;padding:10px 12px;margin-bottom:14px}
-@media (max-width:640px){.hide-sm{display:none}}
+.flash{display:flex;gap:10px;align-items:flex-start;border-radius:12px;padding:12px 16px;margin-bottom:20px;
+word-break:break-all;border:1px solid transparent}
+.flash.ok{background:#f0fdf4;color:#14532d;border-color:#bbf7d0}.flash.bad{background:#fef2f2;color:#7f1d1d;border-color:#fecaca}
+.list{border:1px solid var(--line);border-radius:12px;overflow:hidden}
+.item{padding:14px 16px;border-bottom:1px solid var(--line)}.item:last-child{border-bottom:0}
+.item:hover{background:#fafbfc}
+.item .top{display:flex;align-items:center;gap:12px;flex-wrap:wrap}
+.item .nm{font-weight:600;min-width:0;word-break:break-all}
+.item .meta{color:var(--muted);font-size:12px;display:flex;gap:14px;flex-wrap:wrap;margin-top:2px}
+.item .acts{margin-left:auto;display:flex;gap:8px;align-items:center}
+.mono,code,pre{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+code{background:#f3f4f6;border-radius:5px;padding:1px 6px;font-size:12px;white-space:nowrap}
+pre{background:#0f172a;color:#e2e8f0;border-radius:10px;padding:14px;font-size:12px;white-space:pre-wrap;
+word-break:break-all;margin:10px 0 0;line-height:1.55}
+details>summary{cursor:pointer;color:var(--primary);font-size:12px;list-style:none;display:inline-flex;
+align-items:center;gap:4px;user-select:none}
+details>summary::-webkit-details-marker{display:none}
+details>summary::before{content:"▸";transition:transform .15s}details[open]>summary::before{transform:rotate(90deg)}
+.muted{color:var(--muted)}.empty{color:var(--muted);text-align:center;padding:36px 16px}
+.form-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:16px;margin-bottom:18px}
+label{display:block;font-size:13px;color:#374151;font-weight:500;margin-bottom:6px}
+input,select{width:100%;height:38px;padding:0 12px;border:1px solid #d1d5db;border-radius:9px;font:inherit;
+background:#fff;color:var(--text)}
+input::placeholder{color:var(--faint)}
+input:focus,select:focus{outline:0;border-color:var(--primary);box-shadow:0 0 0 3px rgba(99,102,241,.18)}
+.hint{font-size:12px;color:var(--muted);margin:14px 0 0}
+.notice{font-size:13px;border-radius:10px;padding:10px 14px;margin-top:14px;background:var(--warn-bg);color:#78350f}
+.sub-box{display:flex;gap:10px;align-items:stretch;flex-wrap:wrap}
+.sub-box .url{flex:1;min-width:240px;background:#f8fafc;border:1px solid var(--line);border-radius:9px;padding:9px 12px;
+font-size:12px;word-break:break-all}
+footer{max-width:1120px;margin:0 auto;padding:0 24px 32px;color:var(--faint);font-size:12px;text-align:center}
+.login-wrap{min-height:100vh;display:flex;align-items:center;justify-content:center;padding:24px;
+background:radial-gradient(1200px 600px at 10% -10%,#e0e7ff 0,transparent 60%),
+radial-gradient(900px 500px at 110% 110%,#ede9fe 0,transparent 60%),var(--bg)}
+.login{width:100%;max-width:400px}
+.login .card{padding:34px 32px;margin:0}
+.login .head{display:flex;align-items:center;gap:12px;margin-bottom:22px}
+.login h1{font-size:20px;margin:0}.login p.sub{color:var(--muted);margin:0;font-size:13px}
+.login .field{margin-bottom:16px}.login .btn{width:100%;height:40px;margin-top:6px}
+.login .foot{text-align:center;color:var(--faint);font-size:12px;margin-top:18px}
+.err{background:#fef2f2;border:1px solid #fecaca;color:#7f1d1d;border-radius:10px;padding:10px 12px;margin-bottom:16px}
+@media (max-width:640px){.hide-sm{display:none}.stats{grid-template-columns:repeat(2,1fr);gap:12px}.stat .val{font-size:18px}.grid{grid-template-columns:1fr}main{padding:20px 14px 40px}.topbar .in{padding:10px 14px}
+.card{padding:18px}.item .acts{margin-left:0;width:100%}}
 """
 
 JS = """
 function syncKind(){var k=document.getElementById('kind').value;
 document.querySelectorAll('[data-kind]').forEach(function(e){e.style.display=e.dataset.kind===k?'':'none'})}
-function copyText(id,btn){var t=document.getElementById(id).textContent;
-navigator.clipboard.writeText(t).then(function(){var o=btn.textContent;btn.textContent='已复制';
-setTimeout(function(){btn.textContent=o},1500)})}
+function copyText(id,btn){var t=document.getElementById(id).textContent;var o=btn.textContent;
+function done(){btn.textContent='已复制';setTimeout(function(){btn.textContent=o},1500)}
+if(navigator.clipboard){navigator.clipboard.writeText(t).then(done,function(){fallback()})}else{fallback()}
+function fallback(){var a=document.createElement('textarea');a.value=t;document.body.appendChild(a);a.select();
+try{document.execCommand('copy');done()}catch(e){}document.body.removeChild(a)}}
 document.addEventListener('DOMContentLoaded',function(){var k=document.getElementById('kind');
-if(k){k.addEventListener('change',syncKind);syncKind()}});
+if(k){k.addEventListener('change',syncKind);syncKind()}
+document.querySelectorAll('form[data-busy]').forEach(function(f){f.addEventListener('submit',function(){
+var b=f.querySelector('button[type=submit],button:not([type])');if(b){b.disabled=true;b.textContent=f.dataset.busy}})})});
 """
 
 STATE_ZH = {"active": ("运行中", "ok"), "inactive": ("已停止", "bad"), "failed": ("失败", "bad"),
             "activating": ("启动中", "warn"), "deactivating": ("停止中", "warn"),
-            "reloading": ("重载中", "warn")}
-TLS_ZH = {"staging": ("LE 测试证书", "warn", "Let's Encrypt staging 证书不受公众信任，客户端需开启 skip-cert-verify"),
-          "internal": ("内部 CA", "warn", "Caddy 内部 CA 自签证书，仅供开发测试"),
+            "reloading": ("重载中", "warn"), "unknown": ("未知", "bad")}
+TLS_ZH = {"staging": ("LE 测试证书", "warn", "Let's Encrypt 测试（staging）证书不受公众信任，客户端需开启 skip-cert-verify。"),
+          "internal": ("内部 CA", "warn", "Caddy 内部 CA 自签证书，仅供开发测试，客户端需开启 skip-cert-verify。"),
           "production": ("Let's Encrypt", "ok", "")}
 KIND_ZH = {"vless-reality": "VLESS Reality", "hysteria2": "Hysteria2", "snell": "Snell",
            "trusttunnel": "TrustTunnel"}
+
+
+def short_version(v: str) -> str:
+    m = re.search(r"v\d+\.\d+\.\d+\S*", v or "")
+    return m.group(0) if m else (v or "")
+
+
+def parse_since(s: str):
+    """systemd 'Mon 2026-10-26 17:55:14 UTC' -> ('2026-10-26 17:55:14 UTC', '1 小时 5 分钟')."""
+    m = re.search(r"(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})(?:\s+(\S+))?", s or "")
+    if not m:
+        return "", ""
+    shown = m.group(1) + (" " + m.group(2) if m.group(2) else "")
+    try:
+        t = time.strptime(m.group(1), "%Y-%m-%d %H:%M:%S")
+        ts = calendar.timegm(t) if (m.group(2) or "UTC") == "UTC" else time.mktime(t)
+        sec = max(0, int(time.time() - ts))
+    except ValueError:
+        return shown, ""
+    d, h, mi = sec // 86400, sec % 86400 // 3600, sec % 3600 // 60
+    up = (f"{d} 天 {h} 小时" if d else f"{h} 小时 {mi} 分钟" if h else f"{mi} 分钟" if mi else "不到 1 分钟")
+    return shown, up
 
 
 def page(title, body, scripts=False):
@@ -414,8 +496,9 @@ def parse_cert(info: str) -> dict:
     if m:
         try:
             exp = time.mktime(time.strptime(m.group(1).strip(), "%b %d %H:%M:%S %Y %Z"))
-            out["expires"] = time.strftime("%Y-%m-%d", time.localtime(exp))
+            out["expires"] = time.strftime("%Y-%m-%d %H:%M", time.localtime(exp))
             out["days"] = int((exp - time.time()) // 86400)
+            out["hours"] = max(0, int((exp - time.time()) // 3600))
         except ValueError:
             out["expires"] = m.group(1).strip()
     m = re.search(r"issuer=(.+)", info)
@@ -467,9 +550,10 @@ class Panel(BaseHTTPRequestHandler):
         self.redirect(f"/?ok={1 if ok else 0}&msg=" + quote(msg[:600]))
 
     def simple(self, code, title, text):
-        self.send(code, page(title, f"<div class=login><div class=card><h1>{html.escape(title)}</h1>"
-                                    f"<p class=sub>{html.escape(text)}</p><a class='btn primary' href=/>返回</a>"
-                                    f"</div></div>"))
+        self.send(code, page(title, f"<div class=login-wrap><div class=login><div class=card>"
+                                    f"<div class=head><div class=logo>C</div><div><h1>{html.escape(title)}</h1>"
+                                    f"<p class=sub>{html.escape(text)}</p></div></div>"
+                                    f"<a class='btn primary' href=/>返回控制台</a></div></div></div>"))
 
     def session(self):
         for part in (self.headers.get("Cookie") or "").split(";"):
@@ -483,7 +567,7 @@ class Panel(BaseHTTPRequestHandler):
     def form(self):
         n = int(self.headers.get("Content-Length") or 0)
         if n > 65536:
-            raise ValueError("body too large")
+            raise ValueError("请求体过大")
         raw = self.rfile.read(n).decode()
         return {k: v[0] for k, v in parse_qs(raw).items()}
 
@@ -615,12 +699,15 @@ class Panel(BaseHTTPRequestHandler):
     # -- views
     def login_page(self, err=""):
         e = f"<div class=err>{html.escape(err)}</div>" if err else ""
-        return page("登录 · clashserve", f"""<div class=login><div class=card>
-<h1>clash<span style=color:var(--primary)>serve</span></h1><p class=sub>服务器管理面板</p>{e}
+        return page("登录 · Clash Serve", f"""<div class=login-wrap><div class=login><div class=card>
+<div class=head><div class=logo>C</div><div><h1>Clash Serve</h1><p class=sub>服务器管理面板 · 请登录</p></div></div>{e}
 <form method=post action=/login>
-<div class=field><label for=u>用户名</label><input id=u name=username value=admin autocomplete=username></div>
-<div class=field><label for=p>密码</label><input id=p name=password type=password autocomplete=current-password autofocus></div>
-<button class='btn primary'>登录</button></form></div></div>""")
+<div class=field><label for=u>用户名</label><input id=u name=username value=admin autocomplete=username required></div>
+<div class=field><label for=p>密码</label><input id=p name=password type=password autocomplete=current-password
+placeholder="请输入面板密码" required autofocus></div>
+<button class='btn primary'>登 录</button></form>
+<div class=foot>忘记密码？在服务器上执行 <code>clashserver reset-password</code></div>
+</div></div></div>""")
 
     def dashboard(self, s):
         q = parse_qs(urlparse(self.path).query)
@@ -631,91 +718,128 @@ class Panel(BaseHTTPRequestHandler):
         hid = f"<input type=hidden name=csrf value='{e(s['csrf'])}'>"
         listening = set(st["listening"])
         state_txt, state_cls = STATE_ZH.get(st["active"], (st["active"], "bad"))
+        since, uptime = parse_since(st["since"]) if st["active"] == "active" else ("", "")
+        version = short_version(st["version"])
+        nodes, inbs = read_nodes(), load_inbounds()
+        ports = [n["port"] for n in nodes] + [i["port"] for i in inbs]
+        n_listen = sum(1 for p in ports if p in listening)
+        cert = parse_cert(st["cert"].get("info", ""))
+        days = cert.get("days")
+
+        # --- summary stats
+        def stat(label, val, sub=""):
+            return (f"<div class=stat><div class=lb>{label}</div><div class=val>{val}</div>"
+                    f"<div class=sub>{sub or '&nbsp;'}</div></div>")
+        hours = cert.get("hours")
+        if days is not None and days < 1:
+            left, cert_val = f"{hours} 小时", f"{hours}<small>小时</small>"
+        else:
+            left, cert_val = f"{days} 天", (f"{days}<small>天</small>" if days is not None else ("未知" if cert else "未同步"))
+        cert_sub = f"到期 {e(cert.get('expires', ''))}" if cert.get("expires") else "证书剩余有效期"
+        stats = "<div class=stats>" + "".join([
+            stat(f"<span class='dot {state_cls}'></span>内核状态", e(state_txt),
+                 f"已运行 {uptime}" if uptime else "Mihomo 服务"),
+            stat("入站节点", f"{len(ports)}<small>个</small>", f"{n_listen} 个正在监听"),
+            stat("证书有效期", cert_val, cert_sub),
+            stat("内核版本", e(version or "未知"), "Mihomo"),
+        ]) + "</div>"
 
         # --- status card
-        status = f"""<div class=card><h2>Mihomo 内核 <span class='pill {state_cls}'>{e(state_txt)}</span></h2>
-<dl class=kv><dt>版本</dt><dd>{e(st['version'] or '未知')}</dd>
-<dt>进程 PID</dt><dd>{e(st['pid'] or '-')}</dd>
-<dt>启动时间</dt><dd>{e(st['since'] or '-')}</dd>
-<dt>重启次数</dt><dd>{e(st['restarts'] or '0')}</dd></dl>
+        status = f"""<div class=card><div class=card-h><h2>Mihomo 内核</h2>
+<span class='pill {state_cls}'><span class='dot {state_cls}'></span>{e(state_txt)}</span></div>
+<dl class=kv><dt>版本</dt><dd class=mono>{e(version or '未知')}</dd>
+<dt>进程 PID</dt><dd class=mono>{e(st['pid'] if st['pid'] not in ('', '0') else '—')}</dd>
+<dt>启动时间</dt><dd>{e(since or '—')}</dd>
+<dt>自动重启</dt><dd>{e(st['restarts'] or '0')} 次</dd></dl>
 <div class=row>
-<form class=inline method=post action=/action/restart>{hid}<button class='btn primary'>重启</button></form>
-<form class=inline method=post action=/action/reload>{hid}<button class=btn title='先校验配置，再发送 SIGHUP'>重载配置</button></form>
+<form class=inline method=post action=/action/restart data-busy=正在重启…>{hid}<button class='btn primary'>重启内核</button></form>
+<form class=inline method=post action=/action/reload data-busy=正在重载…>{hid}<button class=btn title='先校验配置，通过后再热重载'>重载配置</button></form>
 </div></div>"""
 
         # --- tls card
-        tls_txt, tls_cls, tls_hint = TLS_ZH.get(env.get("TLS", ""), (env.get("TLS", "-"), "tag", ""))
-        cert = parse_cert(st["cert"].get("info", ""))
+        tls_txt, tls_cls, tls_hint = TLS_ZH.get(env.get("TLS", ""), (env.get("TLS", "") or "未知", "gray", ""))
         if cert:
-            days = cert.get("days")
             days_html = ""
             if days is not None:
-                dcls = "ok" if days > 14 else ("warn" if days > 3 else "bad")
-                days_html = f" <span class='pill {dcls}'>剩余 {days} 天</span>"
-            cert_rows = (f"<dt>颁发者</dt><dd>{e(cert.get('issuer', '-'))}</dd>"
-                         f"<dt>到期时间</dt><dd>{e(cert.get('expires', '-'))}{days_html}</dd>")
+                dcls = "ok" if days > 14 else ("warn" if days > 3 or (hours or 0) >= 1 else "bad")
+                days_html = f" <span class='pill {dcls}'>剩余 {left}</span>"
+            cert_rows = (f"<dt>颁发者</dt><dd>{e(cert.get('issuer', '—'))}</dd>"
+                         f"<dt>到期时间</dt><dd>{e(cert.get('expires', '—'))}{days_html}</dd>")
         else:
             cert_rows = "<dt>证书</dt><dd><span class='pill bad'>未同步</span></dd>"
-        hint = f"<p class=hint>{e(tls_hint)}</p>" if tls_hint else ""
-        tls = f"""<div class=card><h2>域名与证书 <span class='pill {tls_cls}'>{e(tls_txt)}</span></h2>
-<dl class=kv><dt>面板地址</dt><dd>https://{e(env.get('DOMAIN', '-'))}</dd>
-<dt>服务器 IP</dt><dd>{e(env.get('SERVER_IP', '-'))}</dd>{cert_rows}</dl>{hint}</div>"""
+        hint = f"<div class=notice>{e(tls_hint)}</div>" if tls_hint else ""
+        tls = f"""<div class=card><div class=card-h><h2>域名与证书</h2><span class='pill {tls_cls}'>{e(tls_txt)}</span></div>
+<dl class=kv><dt>面板地址</dt><dd class=mono>https://{e(env.get('DOMAIN', '—'))}</dd>
+<dt>服务器 IP</dt><dd class=mono>{e(env.get('SERVER_IP', '—'))}</dd>{cert_rows}</dl>{hint}</div>"""
 
-        # --- inbounds table
+        # --- inbounds list
         def state(port):
-            return ("<span class='pill ok'>监听中</span>" if port in listening
-                    else "<span class='pill bad'>未监听</span>")
+            return ("<span class='pill ok'><span class='dot ok'></span>监听中</span>" if port in listening
+                    else "<span class='pill bad'><span class='dot bad'></span>未监听</span>")
+
+        def client_block(cid, proxy):
+            snippet = e("- " + json.dumps(proxy, ensure_ascii=False))
+            return (f"<details><summary>查看客户端配置</summary><pre id={cid}>{snippet}</pre>"
+                    f"<button type=button class='btn sm' style=margin-top:8px onclick=\"copyText('{cid}',this)\">复制</button>"
+                    f"</details>")
+
+        def item(name, kind, port, extra_meta, acts, cid, proxy):
+            return (f"<div class=item><div class=top><div><div class=nm>{e(name)}</div>"
+                    f"<div class=meta><span>端口 <b class=mono>{port}</b></span>{extra_meta}</div></div>"
+                    f"<span class='pill k-{kind}'>{e(KIND_ZH.get(kind, kind))}</span>{state(port)}"
+                    f"<div class=acts>{acts}</div></div>{client_block(cid, proxy)}</div>")
 
         rows = []
-        for n in read_nodes():
-            rows.append(f"<tr><td>{e(n['name'])}<div class=muted style=font-size:12px>安装时生成 · 客户端配置见 info</div></td>"
-                        f"<td><span class='pill tag'>VLESS Reality</span></td><td class=mono>{n['port']}</td>"
-                        f"<td>{state(n['port'])}</td><td></td></tr>")
-        for i in load_inbounds():
-            cid = f"c-{i['id']}"
-            snippet = e("- " + json.dumps(i["client"], ensure_ascii=False))
-            rows.append(
-                f"<tr><td>{e(i['name'])}<details><summary>客户端配置</summary>"
-                f"<pre id={cid}>{snippet}</pre>"
-                f"<button type=button class='btn sm' style=margin-top:6px onclick=\"copyText('{cid}',this)\">复制</button>"
-                f"</details></td>"
-                f"<td><span class='pill tag'>{e(KIND_ZH.get(i['kind'], i['kind']))}</span></td>"
-                f"<td class=mono>{i['port']}</td><td>{state(i['port'])}</td>"
-                f"<td style=text-align:right><form class=inline method=post action=/inbounds/{i['id']}/delete>{hid}"
-                f"<button class='btn sm danger' onclick=\"return confirm('确定删除入站「{e(i['name'])}」？')\">删除</button>"
-                f"</form></td></tr>")
-        body_rows = "".join(rows) or "<tr><td colspan=5 class=empty>暂无入站</td></tr>"
-        inbounds = f"""<div class=card><h2>入站节点 <span class=muted style=font-weight:400>共 {len(rows)} 个</span></h2>
-<table><tr><th>名称</th><th>类型</th><th>端口</th><th>状态</th><th></th></tr>{body_rows}</table></div>"""
+        for idx, n in enumerate(nodes):
+            rows.append(item(n["name"], "vless-reality", n["port"], "<span>安装时生成</span>",
+                             "<span class='pill gray' title='安装时生成的节点不能在面板删除'>系统节点</span>",
+                             f"r-{idx}", reality_client(n, env)))
+        for i in inbs:
+            created = time.strftime("%Y-%m-%d %H:%M", time.localtime(i.get("created", 0))) if i.get("created") else ""
+            acts = (f"<form class=inline method=post action=/inbounds/{i['id']}/delete>{hid}"
+                    f"<button class='btn sm danger' onclick=\"return confirm('确定删除入站「{e(i['name'])}」？删除后客户端将无法连接。')\">删除</button></form>")
+            rows.append(item(i["name"], i["kind"], i["port"],
+                             f"<span>面板添加{(' · ' + created) if created else ''}</span>",
+                             acts, f"c-{i['id']}", i["client"]))
+        body_rows = "".join(rows) or "<div class=empty>暂无入站节点，可在下方添加。</div>"
+        inbounds = f"""<div class=card><div class=card-h><h2>入站节点</h2><span class='pill gray'>共 {len(rows)} 个</span>
+<div class=desc>展开「查看客户端配置」可复制单个节点的 proxies 配置。</div></div>
+<div class=list>{body_rows}</div></div>"""
 
         # --- add form
         opts = "".join(f"<option value={k}>{v}</option>" for k, v in KIND_ZH.items())
-        no_cert = "" if certs_present() else "<p class=hint>⚠ 尚未同步证书，Hysteria2 / TrustTunnel 暂不可添加。</p>"
-        add = f"""<div class=card><h2>添加入站</h2>
-<form method=post action=/inbounds/add>{hid}<div class=form-grid>
-<div><label for=kind>类型</label><select id=kind name=kind>{opts}</select></div>
-<div><label>端口</label><input name=port inputmode=numeric placeholder="留空则随机"></div>
-<div><label>名称</label><input name=name placeholder="留空则自动生成"></div>
+        no_cert = "" if certs_present() else "<div class=notice>尚未同步证书，暂时无法添加 Hysteria2 / TrustTunnel。</div>"
+        add = f"""<div class=card><div class=card-h><h2>添加入站</h2></div>
+<form method=post action=/inbounds/add data-busy=正在添加…>{hid}<div class=form-grid>
+<div><label for=kind>协议类型</label><select id=kind name=kind>{opts}</select></div>
+<div><label for=port>端口</label><input id=port name=port inputmode=numeric placeholder="留空则随机分配"></div>
+<div><label for=nm>名称</label><input id=nm name=name placeholder="留空则自动生成"></div>
 <div data-kind=snell><label>Snell 版本</label><select name=snell_version><option value=5>v5</option><option value=4>v4</option></select></div>
 <div data-kind=trusttunnel><label>TrustTunnel 用户名</label><input name=tt_user placeholder="默认 user"></div>
-</div><button class='btn primary'>添加</button></form>
-<p class=hint>密码、UUID、密钥均自动随机生成。Hysteria2 / TrustTunnel 使用已同步的证书，Snell / Reality 无需证书。
-保存前会用 <code>mihomo -t</code> 校验，失败自动回滚。</p>{no_cert}</div>"""
+</div><button class='btn primary'>添加入站</button></form>
+<p class=hint>密码、UUID、密钥均自动随机生成；Hysteria2 / TrustTunnel 使用已同步的证书，Snell / Reality 无需证书。
+保存前会自动校验配置，校验失败会自动回滚，不影响现有节点。</p>{no_cert}</div>"""
 
         url = self.sub_url()
         if url:
-            sub = f"""<div class=card><h2>订阅链接 <span class='pill tag'>mihomo.yaml</span></h2>
-<pre id=sub-url>{e(url)}</pre>
-<div class=row style=margin-top:10px><button type=button class='btn sm' onclick="copyText('sub-url',this)">复制链接</button>
-<span class=muted style=font-size:12px>包含全部节点，将链接导入 mihomo / Clash 客户端即可。链接即凭证，请勿外泄；更换链接：<code>install.sh reset-sub</code></span></div></div>"""
+            sub = f"""<div class=card><div class=card-h><h2>订阅链接</h2><span class='pill tag'>mihomo.yaml</span>
+<div class=desc>包含全部节点，导入 mihomo / Clash 客户端即可。链接即凭证，请勿外泄；如需更换，在服务器执行 <code>clashserver reset-sub</code>。</div></div>
+<div class=sub-box><div class='url mono' id=sub-url>{e(url)}</div>
+<button type=button class='btn primary' onclick="copyText('sub-url',this)">复制链接</button></div></div>"""
         else:
             sub = ""
-        fl = f"<div class='flash {'ok' if ok else 'bad'}'>{e(msg)}</div>" if msg else ""
-        top = f"""<div class=topbar><div class=in><div class=brand>clash<span>serve</span></div>
-<div class='host hide-sm'>{e(env.get('VPS_NAME', ''))}</div><div class=spacer></div>
-<form class=inline method=post action=/logout>{hid}<button class='btn sm'>退出登录</button></form></div></div>"""
-        return page("控制台 · clashserve",
-                    f"{top}<main>{fl}<div class=grid>{status}{tls}</div>{sub}{inbounds}{add}</main>", scripts=True)
+        icon = "✓" if ok else "!"
+        fl = f"<div class='flash {'ok' if ok else 'bad'}'><b>{icon}</b><div>{e(msg)}</div></div>" if msg else ""
+        vps = env.get("VPS_NAME", "")
+        top = f"""<div class=topbar><div class=in><div class=logo>C</div>
+<div class=brand><b>Clash Serve</b><small>服务器管理面板</small></div>
+<span class='chip hide-sm'><span class='dot {state_cls}'></span>{e(vps or env.get('DOMAIN', ''))}</span><div class=spacer></div>
+<form class=inline method=post action=/logout>{hid}<button class='btn sm ghost'>退出登录</button></form></div></div>"""
+        head = f"""<div class=page-h><div><h1>控制台</h1><p>{e(env.get('DOMAIN', ''))}</p></div>
+<a class='btn sm' href=/>刷新</a></div>"""
+        return page("控制台 · Clash Serve",
+                    f"{top}<main>{fl}{head}{stats}<div class=grid>{status}{tls}</div>{sub}{inbounds}{add}</main>",
+                    scripts=True)
 
 
 def serve(cfg_path):
@@ -738,7 +862,7 @@ def main():
     if a.cmd == "hash-password":
         pw = sys.stdin.readline().rstrip("\n")
         if len(pw) < 8:
-            sys.exit("password too short")
+            sys.exit("密码太短（至少 8 位）")
         print(hash_password(pw))
     else:
         serve(a.config)

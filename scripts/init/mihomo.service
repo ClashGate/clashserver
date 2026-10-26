@@ -18,7 +18,8 @@ StateDirectoryMode=0750
 Environment=SAFE_PATHS=/etc/mihomo
 ExecStartPre=/usr/local/bin/mihomo -t -d /var/lib/mihomo -f /etc/mihomo/config.yaml
 ExecStart=/usr/local/bin/mihomo -d /var/lib/mihomo -f /etc/mihomo/config.yaml
-ExecReload=/bin/kill -HUP $MAINPID
+# sh builtin kill: minimal Debian may lack procps' /bin/kill
+ExecReload=/bin/sh -c 'kill -HUP $MAINPID'
 Restart=on-failure
 RestartSec=5
 LimitNOFILE=1048576
