@@ -12,14 +12,15 @@
   <img alt="Init: systemd" src="https://img.shields.io/badge/init-systemd-blue" />
   <img alt="Core: Mihomo" src="https://img.shields.io/badge/core-Mihomo-6f42c1" />
   <img alt="Language: Shell" src="https://img.shields.io/github/languages/top/saulsburyroy/clashserver" />
+  <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-green" /></a>
 </p>
 
 ## ✨ 特性
 
 - **傻瓜式一键**：一条 `curl | bash` 命令，中文交互，直接回车即可完成安装；默认值覆盖常见场景，无需记参数。
 - **两种模式**：
-  - **无证书模式**（默认）：3 个 VLESS Reality 节点，不需要域名，安装后直接输出客户端配置。
-  - **自动证书模式**（`-d 域名`）：自动安装 Caddy、申请 Let's Encrypt 证书，提供 HTTPS 管理面板和订阅链接。
+  - **无证书模式**（默认）：VLESS Reality 节点，不需要域名，安装后直接输出客户端配置。
+  - **自动证书模式**：自动安装 Caddy、申请 Let's Encrypt 证书，提供 HTTPS 管理面板和订阅链接。
 - **管理面板**：中文 Web 面板，查看 Mihomo 状态、一键重启 / 重载，添加 VLESS Reality / Hysteria2 / Snell / TrustTunnel 入站，复制订阅链接。
 - **订阅链接**：`https://域名/sub/<随机串>/mihomo.yaml`，带随机凭证，可随时更换。
 - **`clashserver` 命令**：安装后直接输入 `clashserver` 打开中文管理菜单；常用操作都有短子命令。
@@ -35,11 +36,7 @@ curl -fsSL https://raw.githubusercontent.com/saulsburyroy/clashserver/main/insta
 
 按提示选择模式，**直接回车即为无证书模式**。
 
-已有域名，想要管理面板和订阅链接（自动证书模式）：
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/saulsburyroy/clashserver/main/install.sh | bash -s -- -d 你的域名
-```
+已有域名，想要管理面板和订阅链接：选择 **2) 自动证书模式**，按提示输入域名即可。
 
 - 环境：Debian 12（推荐）、systemd、root，服务器可直连 GitHub。
 - 自动证书模式需要：域名 A 记录指向本机，公网可访问 **80 / 443**；Cloudflare 请设为 **灰云（DNS only）**。
@@ -86,22 +83,9 @@ clashserver
   log                查看最近日志
   update             更新 Mihomo 内核 + clashserver 自身
   uninstall          卸载
-  install            重新安装（参数同一键安装）
+  install            重新安装（按提示选择模式）
   help               显示帮助
 ```
-
-### 可选参数
-
-一般不需要，通过 `bash -s -- 参数` 传给一键安装命令：
-
-| 参数 | 说明 |
-|---|---|
-| `-d 域名` | 开启自动证书模式 |
-| `-e 邮箱` | 证书通知邮箱 |
-| `--nodes N` | Reality 节点数量，默认 3 |
-| `--name 名称` | 节点名中的 VPS 名称，默认主机名 |
-| `--ip IP` | 客户端使用的服务器 IP，默认自动探测 |
-| `--force` | 已安装时不询问，直接卸载重装 |
 
 ## 🖥️ 管理面板与订阅（自动证书模式）
 
@@ -158,3 +142,7 @@ scripts/
 
 - 本项目仅用于学习和研究 Shell 与网络技术，不得将项目内容用于违反适用法律法规及相关规定的活动。
 - 本项目保留对本声明进行补充或修改的权利。使用本项目前，请阅读并遵守本声明。
+
+## 📄 许可证
+
+[MIT](LICENSE)

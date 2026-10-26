@@ -42,7 +42,13 @@ detect_ip() {
   for u in https://api.ipify.org https://ifconfig.me https://ipv4.icanhazip.com; do
     SERVER_IP=$(curl -fsS -4 --max-time 5 "$u" 2>/dev/null | tr -d '[:space:]') && [[ -n "$SERVER_IP" ]] && return
   done
-  die "无法探测公网 IP，请用 --ip 指定"
+  if has_tty; then
+    while [[ ! $SERVER_IP =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; do
+      SERVER_IP=$(ask '无法自动探测公网 IP，请手动输入本机公网 IPv4：' '')
+    done
+    return
+  fi
+  die "无法探测公网 IP，请检查服务器网络"
 }
 
 rand_port() {

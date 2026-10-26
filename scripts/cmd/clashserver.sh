@@ -28,7 +28,7 @@ clashserver —— Mihomo 代理服务端管理命令
   update            更新 Mihomo 内核 + clashserver 自身（update core / update self 只更新其一）
   log               查看最近日志
   uninstall         卸载
-  install           重新安装（参数同一键安装：-d 域名、--force 等）
+  install           重新安装（按提示选择模式）
   help              显示本帮助
 
 一键安装：curl -fsSL https://raw.githubusercontent.com/saulsburyroy/clashserver/main/install.sh | bash
@@ -55,20 +55,18 @@ interactive_setup() {
     [[ -n $DOMAIN ]] && printf '域名格式不正确：%s\n' "$DOMAIN"
     DOMAIN=$(ask '请输入域名（需已将 A 记录解析到本机）：' '')
   done
-  ((menu)) || return 0   # 用 -d 等参数启动时不再追问，直接用默认值
+  ((menu)) || return 0   # 开发用隐藏参数 -d 启动时不再追问
   if [[ -z $EMAIL ]]; then EMAIL=$(ask '证书通知邮箱（可选，回车跳过）：' ''); fi
   return 0
 }
 
 check_existing() {
   [[ -f $STATE ]] || return 0
-  if ((!FORCE)); then
-    if has_tty; then
-      [[ $(ask '检测到已安装 clashserver，是否卸载后重新安装？节点和密钥都会重新生成 [y/N]：' n) == [yY]* ]] \
-        || { printf '已取消。查看现有节点：clashserver info\n'; exit 0; }
-    else
-      die "已安装（存在 $STATE）。查看节点：clashserver info；如需重装请加 --force"
-    fi
+  if has_tty; then
+    [[ $(ask '检测到已安装 clashserver，是否卸载后重新安装？节点和密钥都会重新生成 [y/N]：' n) == [yY]* ]] \
+      || { printf '已取消。查看现有节点：clashserver info\n'; exit 0; }
+  else
+    die "已安装（存在 $STATE）。查看节点：clashserver info；如需重装请在终端中运行 clashserver install"
   fi
   printf '正在卸载旧的安装……\n'
   ( CS_IN_REINSTALL=1 do_uninstall ) >/dev/null
@@ -316,7 +314,7 @@ do_menu() {
 
 do_uninstall() {
   load_env
-  if ((!FORCE)) && [[ ${CS_IN_REINSTALL:-0} != 1 ]] && has_tty; then
+  if [[ ${CS_IN_REINSTALL:-0} != 1 ]] && has_tty; then
     [[ $(ask '确定卸载 clashserver？所有节点、证书和配置都会被删除 [y/N]：' n) == [yY]* ]] || { echo "已取消"; return 0; }
   fi
   systemctl disable --now clashserve clashserver-certsync.timer clashserver-certsync.service 2>/dev/null || true
@@ -343,24 +341,15 @@ while (($#)); do
     install|update|uninstall|info|status|sub|passwd|restart|log|menu|reset-password|reset-sub) ACTION=$1 ;;
     core|self) [[ $ACTION == update ]] || die "未知参数：$1"; UPDATE_WHAT=$1 ;;
     help) usage; exit 0 ;;
+    # 以下为开发/测试用隐藏参数，不写入用户文档
     -d|--domain) DOMAIN=${2:?缺少域名}; MODE=auto-cert; MODE_SET=1; shift ;;
-    -e|--email)  EMAIL=${2:?缺少邮箱}; shift ;;
     --staging|--tls-staging) TLS=staging ;;
     --tls-internal) TLS=internal ;;
-    --mode)   MODE=${2:?缺少模式}; MODE_SET=1; shift ;;
-    --no-cert) MODE=no-cert; MODE_SET=1 ;;
-    --nodes)  NODES=${2:?缺少数量}; shift ;;
-    --name)   VPS_NAME=${2:?缺少名称}; shift ;;
-    --ip)     SERVER_IP=${2:?缺少 IP}; shift ;;
-    --force)  FORCE=1 ;;
-    --panel-port) PANEL_PORT=${2:?缺少端口}; shift ;;
     -h|--help) usage; exit 0 ;;
     *) die "未知参数：$1（查看帮助：-h）" ;;
   esac
   shift
 done
-[[ $MODE == no-cert || $MODE == auto-cert ]] || die "--mode 只能是 no-cert 或 auto-cert"
-[[ $NODES =~ ^[1-9][0-9]*$ ]] || die "--nodes 必须是正整数"
 
 # 无子命令：由 install.sh 调用 -> 安装；已安装时直接运行 clashserver -> 管理菜单；未安装 -> 安装
 if [[ -z $ACTION ]]; then

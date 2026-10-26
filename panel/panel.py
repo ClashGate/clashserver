@@ -203,7 +203,7 @@ def build_inbound(kind: str, form: dict, env: dict) -> dict:
         listener = {**base, "type": "trusttunnel", "users": [{"username": user, "password": pw}],
                     "certificate": CERT, "private-key": KEY, "network": ["tcp", "udp"],
                     "congestion-controller": "bbr"}
-        # client schema not verified in E2E (phase-2 scope: config only)
+        # client fields for trusttunnel are best-effort (not connectivity-tested yet)
         client = {"name": f"{label}|Clash|TrustTunnel", "type": "trusttunnel", "server": domain,
                   "port": port, "username": user, "password": pw, "sni": domain,
                   "skip-cert-verify": insecure}

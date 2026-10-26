@@ -23,7 +23,7 @@ LE_STAGING=https://acme-staging-v02.api.letsencrypt.org/directory
 REALITY_SNI=www.sc.com
 DOMAIN_RE='^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$'
 
-MODE=no-cert MODE_SET=0 NODES=3 VPS_NAME="" SERVER_IP="" FORCE=0
+MODE=no-cert MODE_SET=0 NODES=3 VPS_NAME="" SERVER_IP=""   # NODES：固定 3 个 Reality 节点
 DOMAIN="" EMAIL="" TLS=production PANEL_PORT=8088
 CADDY_OURS=0 PANEL_PASS="" PANEL_HASH="" SUB_TOKEN="" WARNINGS=()
 STEP=0; TOTAL=8

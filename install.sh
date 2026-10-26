@@ -2,10 +2,9 @@
 # clashserver 一键安装入口
 #
 #   curl -fsSL https://raw.githubusercontent.com/saulsburyroy/clashserver/main/install.sh | bash
-#   curl -fsSL https://raw.githubusercontent.com/saulsburyroy/clashserver/main/install.sh | bash -s -- -d 你的域名
 #
 # 通过 curl|bash 运行时只有本文件：先从公开仓库下载完整文件（直连 GitHub，不使用任何代理），
-# 再交给 scripts/cmd/clashserver.sh 执行安装。参数说明：bash install.sh help
+# 再交给 scripts/cmd/clashserver.sh 执行安装（按提示选择模式、填写域名）。
 set -Eeuo pipefail
 
 REPO_TARBALL=https://github.com/saulsburyroy/clashserver/archive/refs/heads/main.tar.gz
