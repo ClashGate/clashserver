@@ -1,0 +1,11 @@
+[Unit]
+Description=clashserver: periodic Caddy -> mihomo certificate sync
+
+[Timer]
+OnBootSec=2min
+# Hourly so short-lived `tls internal` dev certs are also kept fresh; a no-op when unchanged.
+OnUnitActiveSec=1h
+Persistent=true
+
+[Install]
+WantedBy=timers.target

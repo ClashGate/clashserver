@@ -1,0 +1,7 @@
+[Unit]
+Description=clashserver: sync Caddy certificate to /etc/mihomo/certs
+After=caddy.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/lib/clashserver/certsync.sh --restart

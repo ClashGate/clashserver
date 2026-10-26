@@ -1,0 +1,19 @@
+[Unit]
+Description=clashserve panel (clashserver auto-cert mode)
+After=network-online.target mihomo.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Runs as root so it can rewrite /etc/mihomo and call systemctl; bound to 127.0.0.1 behind Caddy only.
+ExecStart=/usr/bin/python3 /usr/local/lib/clashserver/panel.py serve --config /etc/clashserver/panel.json
+Restart=on-failure
+RestartSec=3
+ProtectSystem=strict
+ReadWritePaths=/etc/mihomo /etc/clashserver
+ProtectHome=true
+PrivateTmp=true
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target
