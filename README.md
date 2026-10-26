@@ -110,9 +110,7 @@ scripts/certsync.sh   # Caddy 证书同步到 Mihomo
 systemd/              # systemd unit
 ```
 
-## 关于 serve.yaml
-
-开发时会参考一份本地的 `serve.yaml`（真实服务端配置样例），它**不随仓库发布**（已在 `.gitignore` 中）。仓库内的配置全部由模板生成，密钥、端口、UUID 均在安装时随机生成。
+配置由安装脚本从模板生成；密钥、端口、UUID 均在安装时随机生成。
 
 ## 路线图 / Roadmap
 
