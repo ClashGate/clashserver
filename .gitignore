@@ -13,3 +13,6 @@ client-config/
 
 # local AI reference only — never publish (open-source later)
 serve.yaml
+
+# python
+__pycache__/

@@ -4,4 +4,4 @@ After=caddy.service
 
 [Service]
 Type=oneshot
-ExecStart=/usr/local/lib/clashserver/certsync.sh --restart
+ExecStart=/usr/local/lib/clashserver/scripts/certsync.sh --restart

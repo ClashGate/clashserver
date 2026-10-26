@@ -1,120 +1,160 @@
-# Clash Server
+<h1 align="center">
+  clashserver
+</h1>
 
-基于 [Mihomo (Clash Meta)](https://github.com/MetaCubeX/mihomo) 内核的 VPS 一键代理服务端部署脚本。
-One-click Mihomo proxy server installer for a Debian VPS.
+<p align="center">
+  Debian VPS 上的 Mihomo 代理服务端一键部署与管理工具<br />
+  <sub>一条命令装好节点，自带中文管理面板与订阅链接</sub>
+</p>
 
-> 状态：早期开发中。当前目标是先跑通整体框架（安装 → 节点 → 面板 → 卸载），功能与细节后续再补。
-> Status: early development — big framework first, details later.
+<p align="center">
+  <img alt="Platform: Debian" src="https://img.shields.io/badge/platform-Debian-A81D33?logo=debian&amp;logoColor=white" />
+  <img alt="Init: systemd" src="https://img.shields.io/badge/init-systemd-blue" />
+  <img alt="Core: Mihomo" src="https://img.shields.io/badge/core-Mihomo-6f42c1" />
+  <img alt="Language: Shell" src="https://img.shields.io/github/languages/top/saulsburyroy/clashserver" />
+</p>
 
-## 功能 / Features
+## ✨ 特性
 
-- **no-cert 模式**（默认）：不装 Caddy、不申请证书、无面板；直接生成若干 **VLESS + Reality** 节点。
-- **auto-cert 模式**：安装 Caddy 申请证书（Let's Encrypt），并提供 Web 管理面板。
-  - 面板可添加 / 删除入站：VLESS Reality、Hysteria2、Snell、TrustTunnel（hy2 / snell / TrustTunnel 目前只做配置，尚未做连通性验证）。
-  - 证书由 `clashserver-certsync.timer` 每小时同步给 Mihomo。
-- 安装完成后打印客户端 `proxies` 片段，并生成一份 mihomo 客户端配置（路径会打印出来，默认 `/root/clashserver-client`）。
-- 支持 `update`（更新 Mihomo 内核）、`info`、`uninstall`、`reset-password`。
+- **傻瓜式一键**：一条 `curl | bash` 命令，中文交互，直接回车即可完成安装；默认值覆盖常见场景，无需记参数。
+- **两种模式**：
+  - **无证书模式**（默认）：3 个 VLESS Reality 节点，不需要域名，安装后直接输出客户端配置。
+  - **自动证书模式**（`-d 域名`）：自动安装 Caddy、申请 Let's Encrypt 证书，提供 HTTPS 管理面板和订阅链接。
+- **管理面板**：中文 Web 面板，查看 Mihomo 状态、一键重启 / 重载，添加 VLESS Reality / Hysteria2 / Snell / TrustTunnel 入站，复制订阅链接。
+- **订阅链接**：`https://域名/sub/<随机串>/mihomo.yaml`，带随机凭证，可随时更换。
+- **`clashserver` 命令**：安装后直接输入 `clashserver` 打开中文管理菜单；常用操作都有短子命令。
+- **安全默认**：端口、UUID、密钥、密码全部随机生成；面板仅本机监听、由 Caddy HTTPS 反代；改配置前先 `mihomo -t` 校验，失败自动回滚。
 
-## 环境要求 / Requirements
+## 📦 安装
 
-- **Debian 12**（推荐，其他 Debian 系未充分测试），使用 systemd
-- root 权限，可访问 GitHub（下载 Mihomo release）
-- auto-cert 模式另需：一个域名的 A 记录指向 VPS，且 **80 / 443** 端口可从公网访问（HTTP-01 验证）
-
-依赖（`curl gzip jq openssl iproute2` 等，auto-cert 时还有 `python3`、Caddy）由脚本自动安装。
-
-## 安装 / Install
-
-```bash
-git clone https://github.com/saulsburyroy/clashserver.git
-cd clashserver
-sudo ./install.sh install            # 默认 no-cert，3 个 Reality 节点
-```
-
-### no-cert 模式
+以 root 身份执行：
 
 ```bash
-sudo ./install.sh install --nodes 2 --name myvps
-# 指定公网 IP（不指定则自动探测）
-sudo ./install.sh install --nodes 2 --name myvps --ip 203.0.113.10
+curl -fsSL https://raw.githubusercontent.com/saulsburyroy/clashserver/main/install.sh | bash
 ```
 
-### auto-cert 模式
+按提示选择模式，**直接回车即为无证书模式**。
+
+已有域名，想要管理面板和订阅链接（自动证书模式）：
 
 ```bash
-# 生产证书（Let's Encrypt 正式环境）
-sudo ./install.sh install --mode auto-cert --domain proxy.example.com --email you@example.com
-
-# 测试：Let's Encrypt staging（浏览器会提示证书不受信任，用于避免触发正式环境限额）
-sudo ./install.sh install --mode auto-cert --domain proxy.example.com --tls-staging
-
-# 本地 / 无公网域名调试：Caddy 内部 CA（仅开发用）
-sudo ./install.sh install --mode auto-cert --domain panel.test --tls-internal
+curl -fsSL https://raw.githubusercontent.com/saulsburyroy/clashserver/main/install.sh | bash -s -- -d 你的域名
 ```
 
-| 证书选项 | 说明 |
-|---|---|
-| （默认） | Let's Encrypt 正式证书，公开可信 |
-| `--tls-staging` | LE staging，不受信任，用于测试流程 |
-| `--tls-internal` | Caddy 自签内部 CA，仅开发调试 |
+- 环境：Debian 12（推荐）、systemd、root，服务器可直连 GitHub。
+- 自动证书模式需要：域名 A 记录指向本机，公网可访问 **80 / 443**；Cloudflare 请设为 **灰云（DNS only）**。
 
-### Cloudflare 说明
+## 🚀 快速上手
 
-目前只支持 HTTP-01 验证，**不支持** Cloudflare DNS-01。如果域名托管在 Cloudflare，请把 A 记录设为 **DNS only（灰云）**，不要开启代理（橙云），否则证书申请和代理流量都会出问题。
+**无证书模式**：安装结束会打印 `proxies` 片段，并生成完整客户端配置：
 
-## 管理面板 / Panel（auto-cert）
+```
+/root/clashserver-client/mihomo-client.yaml   # 完整 mihomo 客户端配置
+/root/clashserver-client/proxies.yaml         # 仅节点片段
+```
 
-- 地址：`https://<你的域名>/`（Caddy 反代到本机 `127.0.0.1:8088`，可用 `--panel-port` 修改内部端口）
-- 用户名：`admin`
-- 密码：安装时随机生成，**只打印一次**，请立刻保存。忘记密码：
+**自动证书模式**：安装结束会打印订阅链接和面板账号：
+
+```
+订阅链接：https://你的域名/sub/<随机串>/mihomo.yaml   ← 导入 mihomo / Clash 客户端
+管理面板：https://你的域名   用户名 admin   密码（仅显示一次）
+```
+
+之后随时运行：
 
 ```bash
-sudo ./install.sh reset-password
+clashserver
 ```
 
-## 常用命令 / Commands
+打开中文管理菜单，查看状态、节点、订阅链接，修改面板密码等。
 
-```bash
-sudo ./install.sh info        # 查看节点 / 客户端配置
-sudo ./install.sh update      # 更新 Mihomo 内核
-sudo ./install.sh uninstall   # 卸载
-sudo ./install.sh install --force ...   # 已安装或上次中途失败时，先完整卸载再重装
+## ⌨️ 命令一览
+
+```text
+用法：
+  clashserver [子命令]
+
+子命令：
+  （不带参数）        打开中文交互菜单
+  status             运行状态（服务、端口、证书）
+  info               节点配置：proxies 片段、客户端配置目录、订阅链接
+  sub                查看订阅链接（自动证书模式）
+  reset-sub          更换订阅链接，旧链接立即失效
+  passwd             修改面板密码（自定义）
+  reset-password     重置面板密码（随机）
+  restart            重启 Mihomo
+  log                查看最近日志
+  update             更新 Mihomo 内核 + clashserver 自身
+  uninstall          卸载
+  install            重新安装（参数同一键安装）
+  help               显示帮助
 ```
+
+### 可选参数
+
+一般不需要，通过 `bash -s -- 参数` 传给一键安装命令：
 
 | 参数 | 说明 |
 |---|---|
-| `--mode no-cert\|auto-cert` | 安装模式，默认 `no-cert`（`--no-cert` 同义） |
+| `-d 域名` | 开启自动证书模式 |
+| `-e 邮箱` | 证书通知邮箱 |
 | `--nodes N` | Reality 节点数量，默认 3 |
-| `--name NAME` | 节点名中的 VPS 名称，默认主机名 |
-| `--ip IP` | 客户端配置中使用的服务器 IP，默认自动探测 |
-| `--domain D` / `--email E` | auto-cert 的域名 / ACME 邮箱 |
-| `--tls-staging` / `--tls-internal` | 证书来源（见上表） |
-| `--panel-port P` | 面板本地监听端口，默认 8088 |
-| `--force` | 先卸载再安装 |
+| `--name 名称` | 节点名中的 VPS 名称，默认主机名 |
+| `--ip IP` | 客户端使用的服务器 IP，默认自动探测 |
+| `--force` | 已安装时不询问，直接卸载重装 |
 
-## 卸载 / Uninstall
+## 🖥️ 管理面板与订阅（自动证书模式）
+
+- 面板地址 `https://你的域名`，用户名 `admin`，密码安装时随机生成且**只显示一次**。修改：`clashserver passwd`；忘记：`clashserver reset-password`。
+- 订阅链接内容包含全部节点（含面板中新增的节点），每次请求实时生成。
+- **链接即凭证**：没有正确的随机串一律返回 404。泄露后执行 `clashserver reset-sub` 更换，旧链接立即失效。
+- Hysteria2 / Snell / TrustTunnel 目前只做配置写入，尚未做连通性验证；推荐使用 VLESS Reality。
+
+## 🔄 更新
 
 ```bash
-sudo ./install.sh uninstall
+# 同时更新 Mihomo 内核与 clashserver（脚本、面板、模板）
+clashserver update
+
+# 只更新其一
+clashserver update core
+clashserver update self
 ```
 
-会删除 Mihomo、systemd 服务、面板、证书、配置与客户端文件；Caddy 若由本脚本安装则一并卸载，若原本已存在则恢复原 Caddyfile。
+更新不会改变节点、密钥、面板密码和订阅链接。
 
-## 目录结构 / Layout
+## 🗑️ 卸载
 
-```
-install.sh            # 安装 / 卸载 / 更新入口
-templates/            # 服务端、客户端、Caddyfile 模板
-panel/panel.py        # 面板（Python 标准库，无第三方依赖）
-scripts/certsync.sh   # Caddy 证书同步到 Mihomo
-systemd/              # systemd unit
+```bash
+clashserver uninstall
 ```
 
-配置由安装脚本从模板生成；密钥、端口、UUID 均在安装时随机生成。
+删除 Mihomo、systemd 服务、面板、证书、配置、客户端文件和 `clashserver` 命令；Caddy 若由本工具安装则一并卸载，若原本已存在则恢复原 Caddyfile。需要保留的客户端配置请提前备份。
 
-## 路线图 / Roadmap
+## 📂 目录结构
 
-1. ✅ no-cert：VLESS Reality 一键安装
-2. 🚧 auto-cert：Caddy + LE + 面板（框架已通，细节完善中）
+```text
+install.sh               # 一键安装入口（curl|bash 时自动下载其余文件）
+uninstall.sh             # 卸载入口
+panel/panel.py           # 管理面板（Python 标准库，无第三方依赖）
+resources/               # 服务端 / 客户端 / Caddyfile 模板
+scripts/
+  cmd/clashserver.sh     # clashserver 命令：菜单与子命令
+  lib/                   # 公共函数：common / core / cert / panel
+  init/                  # systemd unit
+  certsync.sh            # Caddy 证书同步给 Mihomo
+```
+
+安装后文件位于 `/usr/local/lib/clashserver/`，配置在 `/etc/mihomo/` 与 `/etc/clashserver/`，命令为 `/usr/local/bin/clashserver`。
+
+## 🗺️ 路线图
+
+1. ✅ 无证书模式：VLESS Reality 一键安装
+2. 🚧 自动证书模式：Caddy + LE + 面板 + 订阅链接
 3. ⏳ 自定义反代模式
 4. ⏳ 流量统计、权限、Docker 等
+
+## ⚠️ 特别声明
+
+- 本项目仅用于学习和研究 Shell 与网络技术，不得将项目内容用于违反适用法律法规及相关规定的活动。
+- 本项目保留对本声明进行补充或修改的权利。使用本项目前，请阅读并遵守本声明。
