@@ -39,20 +39,24 @@ INBOUNDS = ROOT + "/etc/clashserver/inbounds.json"
 MIHOMO_DIR = ROOT + "/etc/mihomo"
 CONF = MIHOMO_DIR + "/config.yaml"
 NODES_TSV = MIHOMO_DIR + "/nodes.tsv"
+FRAG_CONTROLLER = MIHOMO_DIR + "/controller.yaml"
 FRAG_REALITY = MIHOMO_DIR + "/listeners.reality.yaml"
 FRAG_EXTRA = MIHOMO_DIR + "/listeners.extra.yaml"
 TEMPLATE = ROOT + "/usr/local/lib/clashserver/resources/server.yaml.tpl"
 CLIENT_TEMPLATE = ROOT + "/usr/local/lib/clashserver/resources/client.yaml.tpl"
+CLIENT_DIR = ROOT + "/root/clashserver-client"
 CERTCTL = ROOT + "/usr/local/lib/clashserver/scripts/certctl.sh"
 CERT = "/etc/mihomo/certs/fullchain.pem"   # paths as seen by mihomo (not ROOT-prefixed)
 KEY = "/etc/mihomo/certs/privkey.pem"
 MIHOMO_BIN = os.environ.get("MIHOMO_BIN", "/usr/local/bin/mihomo")
 SYSTEMCTL = os.environ.get("SYSTEMCTL", "systemctl")
+UFW_BIN = os.environ.get("UFW_BIN", "ufw")
 REALITY_SNI = "www.sc.com"
 PBKDF2_ITER = 600_000
 SESSION_TTL = 12 * 3600
-TYPES = ("vless-reality", "hysteria2", "snell", "trusttunnel")
+TYPES = ("vless-reality", "shadowsocks", "hysteria2", "snell", "trusttunnel")
 CERT_TYPES = ("hysteria2", "trusttunnel")
+SS_CIPHERS = ("aes-128-gcm", "aes-256-gcm", "chacha20-ietf-poly1305")
 
 LOCK = threading.Lock()
 
@@ -112,14 +116,14 @@ def read_nodes() -> list:
                 p = line.rstrip("\n").split("\t")
                 if len(p) >= 7:
                     rows.append({"name": p[0], "port": int(p[1]), "uuid": p[2],
-                                 "pub": p[4], "sid": p[5], "sni": p[6]})
+                                 "priv": p[3], "pub": p[4], "sid": p[5], "sni": p[6]})
     except FileNotFoundError:
         pass
     return rows
 
 
 def used_ports(env) -> set:
-    ports = {80, 443, int(env.get("PANEL_PORT", "0") or 0)}
+    ports = {80, 443, int(env.get("PANEL_PORT", "0") or 0), int(env.get("CONTROLLER_PORT", "7896") or 7896)}
     ports |= {n["port"] for n in read_nodes()}
     ports |= {i["port"] for i in load_inbounds()}
     return ports
@@ -153,6 +157,59 @@ def panel_base_url(env: dict, cfg: dict) -> str:
         return ""
     port = int(cfg.get("port") or env.get("PANEL_PORT") or 8443)
     return f"https://{host}" if port == 443 else f"https://{host}:{port}"
+
+
+def zashboard_url(env: dict) -> str:
+    host = env.get("DOMAIN", "").removeprefix("*.") or env.get("SERVER_IP", "")
+    if not host:
+        return ""
+    cport = int(env.get("CONTROLLER_PORT") or 7896)
+    return f"https://{host}:{cport}/ui/"
+
+
+def zashboard_connect_url(env: dict) -> str:
+    host = env.get("DOMAIN", "").removeprefix("*.") or env.get("SERVER_IP", "")
+    if not host:
+        return ""
+    cport = int(env.get("CONTROLLER_PORT") or 7896)
+    secret = env.get("MIHOMO_SECRET", "")
+    if not secret:
+        return f"https://{host}:{cport}/ui/"
+    qs = f"hostname={quote(host)}&port={cport}&secret={quote(secret)}&https=true"
+    return f"https://{host}:{cport}/ui/?{qs}#/setup?{qs}"
+
+
+def write_env_var(key: str, val: str):
+    lines = []
+    found = False
+    try:
+        with open(ENV_FILE) as f:
+            for line in f:
+                if line.startswith(f"{key}="):
+                    lines.append(f'{key}="{val}"\n')
+                    found = True
+                else:
+                    lines.append(line)
+    except FileNotFoundError:
+        pass
+    if not found:
+        lines.append(f'{key}="{val}"\n')
+    atomic_write(ENV_FILE, "".join(lines), 0o600)
+
+
+def render_controller_fragment(env: dict) -> str:
+    if env.get("MODE") != "auto-cert":
+        return "# controller disabled in no-cert mode\n"
+    cport = env.get("CONTROLLER_PORT") or "7896"
+    secret = env.get("MIHOMO_SECRET", "")
+    return (
+        f'external-controller-tls: "0.0.0.0:{cport}"\n'
+        f"tls:\n  certificate: {CERT}\n  private-key: {KEY}\n"
+        f"external-controller-cors:\n  allow-origins:\n    - '*'\n  allow-private-network: true\n"
+        f'secret: "{secret}"\n'
+        f"external-ui: ui\n"
+        f'external-ui-url: "https://github.com/Zephyruso/zashboard/releases/latest/download/dist-cdn-fonts.zip"\n'
+    )
 
 
 # ---------------------------------------------------------------- inbound model
@@ -191,6 +248,15 @@ def build_inbound(kind: str, form: dict, env: dict) -> dict:
                   "uuid": uid, "tls": True, "flow": "xtls-rprx-vision", "client-fingerprint": "safari",
                   "skip-cert-verify": False, "reality-opts": {"public-key": pub, "short-id": sid},
                   "network": "tcp", "udp": True, "servername": REALITY_SNI}
+    elif kind == "shadowsocks":
+        cipher = (form.get("ss_cipher") or "aes-128-gcm").strip()
+        if cipher not in SS_CIPHERS:
+            raise ValueError("不支持的 Shadowsocks 加密方式")
+        pw = secrets.token_urlsafe(16)
+        listener = {"name": name, "type": "shadowsocks", "udp": True, "port": port,
+                    "listen": "0.0.0.0", "password": pw, "cipher": cipher}
+        client = {"name": f"{label}|Clash|SS", "type": "ss", "server": ip, "port": port,
+                  "cipher": cipher, "password": pw, "udp": True}
     elif kind == "hysteria2":
         pw = secrets.token_urlsafe(18)
         listener = {**base, "type": "hysteria2", "users": {"user": pw},
@@ -224,13 +290,59 @@ def build_inbound(kind: str, form: dict, env: dict) -> dict:
             "created": int(time.time()), "listener": listener, "client": client}
 
 
+def render_nodes_tsv(nodes: list) -> str:
+    return "".join(
+        f"{n['name']}\t{n['port']}\t{n['uuid']}\t{n['priv']}\t{n['pub']}\t{n['sid']}\t{n['sni']}\n"
+        for n in nodes
+    )
+
+
+def render_reality(nodes: list) -> str:
+    out = []
+    for n in nodes:
+        out.append(
+            f"  - name: {n['name']}\n"
+            f"    type: vless\n"
+            f"    port: {n['port']}\n"
+            f"    listen: 0.0.0.0\n"
+            f"    users:\n"
+            f"      - username: user\n"
+            f"        uuid: {n['uuid']}\n"
+            f"        flow: xtls-rprx-vision\n"
+            f"    reality-config:\n"
+            f"      dest: {n['sni']}:443\n"
+            f"      private-key: {n['priv']}\n"
+            f"      short-id:\n"
+            f"        - {n['sid']}\n"
+            f"      server-names:\n"
+            f"        - {n['sni']}\n"
+        )
+    return "".join(out)
+
+
 def render_extra(inbounds: list) -> str:
     # YAML is a superset of JSON: one flow mapping per listener, no escaping pitfalls.
     return "".join("  - " + json.dumps(i["listener"], ensure_ascii=False) + "\n" for i in inbounds)
 
 
 def assemble_config() -> str:
-    """Same logic as install.sh assemble_config: template @@LISTENERS@@ <- reality + extra."""
+    """Same logic as core.sh assemble_config: template @@CONTROLLER@@ + @@LISTENERS@@ <- reality + extra."""
+    ctrl = ""
+    try:
+        with open(FRAG_CONTROLLER) as f:
+            ctrl = f.read()
+    except FileNotFoundError:
+        env = read_env()
+        if env.get("MODE") == "auto-cert" and env.get("MIHOMO_SECRET"):
+            cport = env.get("CONTROLLER_PORT") or "7896"
+            ctrl = (
+                f'external-controller-tls: "0.0.0.0:{cport}"\n'
+                f"tls:\n  certificate: {CERT}\n  private-key: {KEY}\n"
+                f"external-controller-cors:\n  allow-origins:\n    - '*'\n  allow-private-network: true\n"
+                f'secret: "{env["MIHOMO_SECRET"]}"\n'
+                f"external-ui: ui\n"
+                f'external-ui-url: "https://github.com/Zephyruso/zashboard/releases/latest/download/dist-cdn-fonts.zip"\n'
+            )
     block = ""
     for frag in (FRAG_REALITY, FRAG_EXTRA):
         try:
@@ -241,7 +353,10 @@ def assemble_config() -> str:
     out = []
     with open(TEMPLATE) as f:
         for line in f:
-            if line.rstrip("\n") == "@@LISTENERS@@":
+            s = line.rstrip("\n")
+            if s == "@@CONTROLLER@@":
+                out.append(ctrl)
+            elif s == "@@LISTENERS@@":
                 out.append(block)
             else:
                 out.append(line)
@@ -264,12 +379,77 @@ def atomic_write(path: str, data: str, mode=0o640):
 
 def validate_config(path=CONF):
     with tempfile.TemporaryDirectory() as d:
+        os.makedirs(os.path.join(d, "ui"), exist_ok=True)
         env = dict(os.environ, SAFE_PATHS="/etc/mihomo")
         return run([MIHOMO_BIN, "-t", "-d", d, "-f", path], env=env, timeout=60)
 
 
+def ufw_specs_for_node(kind: str, port: int) -> set:
+    p = int(port)
+    if kind == "vless-reality":
+        return {f"{p}/tcp"}
+    if kind == "hysteria2":
+        return {f"{p}/udp"}
+    return {f"{p}/tcp", f"{p}/udp"}
+
+
+def collect_ufw_specs(nodes: list, inbounds: list) -> set:
+    specs = set()
+    for n in nodes:
+        specs |= ufw_specs_for_node("vless-reality", n["port"])
+    for i in inbounds:
+        specs |= ufw_specs_for_node(i["kind"], i["port"])
+    return specs
+
+
+def sync_ufw(old_specs: set, new_specs: set):
+    """When ufw is active, allow newly added node ports and delete removed node ports (including UDP)."""
+    rc, out = run([UFW_BIN, "status"])
+    if rc != 0 or "Status: active" not in out:
+        return
+    env = read_env()
+    protected = {"80/tcp", f"{env.get('PANEL_PORT') or 0}/tcp", f"{env.get('CONTROLLER_PORT') or 7896}/tcp"}
+    for spec in sorted(new_specs - old_specs):
+        run([UFW_BIN, "allow", spec])
+    for spec in sorted((old_specs - new_specs) - protected):
+        run([UFW_BIN, "delete", "allow", spec])
+
+
+def sync_client_files():
+    """Keep /root/clashserver-client/{mihomo-client,proxies}.yaml in sync with current nodes and inbounds."""
+    try:
+        env = read_env()
+        proxies = [reality_client(n, env) for n in read_nodes()] + [i["client"] for i in load_inbounds()]
+        os.makedirs(CLIENT_DIR, mode=0o700, exist_ok=True)
+        atomic_write(CLIENT_DIR + "/mihomo-client.yaml", render_subscription(env), 0o600)
+        p_yaml = "proxies:\n" + "".join("    - " + json.dumps(p, ensure_ascii=False) + "\n" for p in proxies)
+        atomic_write(CLIENT_DIR + "/proxies.yaml", p_yaml, 0o600)
+    except Exception as e:
+        sys.stderr.write(f"sync_client_files warning: {e}\n")
+
+
+def wait_mihomo_ports(timeout=2.0):
+    """Poll ss for up to ~2s so all expected ports are listening before redirecting back to dashboard."""
+    expected = {int(n["port"]) for n in read_nodes()} | {int(i["port"]) for i in load_inbounds()}
+    env = read_env()
+    if env.get("MODE") == "auto-cert":
+        expected.add(int(env.get("CONTROLLER_PORT") or 7896))
+    if not expected:
+        return
+    deadline = time.monotonic() + timeout
+    while True:
+        st = mihomo_status()
+        if st["active"] == "active" and expected.issubset(set(st["listening"])):
+            return
+        if time.monotonic() >= deadline:
+            return
+        time.sleep(0.15)
+
+
 def apply_inbounds(new: list):
     """Write inbounds + fragment + config, validate, restart; roll back on failure."""
+    cur_nodes = read_nodes()
+    old_specs = collect_ufw_specs(cur_nodes, load_inbounds())
     files = (INBOUNDS, FRAG_EXTRA, CONF)
     backup = {}
     for p in files:
@@ -297,6 +477,45 @@ def apply_inbounds(new: list):
                 atomic_write(p, data, 0o600 if p == INBOUNDS else 0o640)
         run([SYSTEMCTL, "restart", "mihomo"])
         raise
+    sync_client_files()
+    sync_ufw(old_specs, collect_ufw_specs(cur_nodes, new))
+    wait_mihomo_ports()
+
+
+def apply_nodes(new_nodes: list):
+    """Update install-time VLESS Reality nodes (nodes.tsv + listeners.reality.yaml + config.yaml), validate, restart; roll back on failure."""
+    cur_inbs = load_inbounds()
+    old_specs = collect_ufw_specs(read_nodes(), cur_inbs)
+    files = (NODES_TSV, FRAG_REALITY, CONF)
+    backup = {}
+    for p in files:
+        try:
+            with open(p) as f:
+                backup[p] = f.read()
+        except FileNotFoundError:
+            backup[p] = None
+    try:
+        atomic_write(NODES_TSV, render_nodes_tsv(new_nodes), 0o640)
+        atomic_write(FRAG_REALITY, render_reality(new_nodes), 0o640)
+        atomic_write(CONF, assemble_config(), 0o640)
+        rc, out = validate_config()
+        if rc != 0:
+            raise RuntimeError("配置校验失败（mihomo -t）：" + out[-800:])
+        rc, out = run([SYSTEMCTL, "restart", "mihomo"])
+        if rc != 0:
+            raise RuntimeError("重启失败：" + out[-800:])
+    except Exception:
+        for p, data in backup.items():
+            if data is None:
+                if os.path.exists(p):
+                    os.remove(p)
+            else:
+                atomic_write(p, data, 0o640)
+        run([SYSTEMCTL, "restart", "mihomo"])
+        raise
+    sync_client_files()
+    sync_ufw(old_specs, collect_ufw_specs(new_nodes, cur_inbs))
+    wait_mihomo_ports()
 
 
 def reality_client(n: dict, env: dict) -> dict:
@@ -391,8 +610,9 @@ white-space:nowrap}
 .pill.ok{background:var(--ok-bg);color:var(--ok)}.pill.bad{background:var(--bad-bg);color:var(--bad)}
 .pill.warn{background:var(--warn-bg);color:var(--warn)}.pill.tag{background:var(--primary-soft);color:var(--primary-h)}
 .pill.gray{background:#f3f4f6;color:#4b5563}
-.k-vless-reality{background:#ede9fe;color:#6d28d9}.k-hysteria2{background:#e0f2fe;color:#0369a1}
-.k-snell{background:#dcfce7;color:#15803d}.k-trusttunnel{background:#ffedd5;color:#c2410c}
+.k-vless-reality{background:#ede9fe;color:#6d28d9}.k-shadowsocks{background:#fce7f3;color:#be185d}
+.k-hysteria2{background:#e0f2fe;color:#0369a1}.k-snell{background:#dcfce7;color:#15803d}
+.k-trusttunnel{background:#ffedd5;color:#c2410c}
 .btn{display:inline-flex;align-items:center;justify-content:center;gap:6px;border:1px solid var(--line);background:#fff;
 color:var(--text);border-radius:9px;padding:8px 16px;font:inherit;font-weight:500;cursor:pointer;
 transition:background .15s,border-color .15s,box-shadow .15s}
@@ -469,8 +689,8 @@ STATE_ZH = {"active": ("运行中", "ok"), "inactive": ("已停止", "bad"), "fa
 TLS_ZH = {"staging": ("LE 测试证书", "warn", "Let's Encrypt 测试（staging）证书不受公众信任，客户端需开启 skip-cert-verify。"),
           "internal": ("自签证书", "warn", "本机自签证书，仅供开发测试，客户端需开启 skip-cert-verify。"),
           "production": ("Let's Encrypt", "ok", "")}
-KIND_ZH = {"vless-reality": "VLESS Reality", "hysteria2": "Hysteria2", "snell": "Snell",
-           "trusttunnel": "TrustTunnel"}
+KIND_ZH = {"vless-reality": "VLESS Reality", "shadowsocks": "Shadowsocks (SS)",
+           "hysteria2": "Hysteria2", "snell": "Snell", "trusttunnel": "TrustTunnel"}
 
 
 def short_version(v: str) -> str:
@@ -624,11 +844,16 @@ class Panel(BaseHTTPRequestHandler):
             return self.do_action(path.rsplit("/", 1)[1])
         if path == "/action/cert":
             return self.do_cert_action()
+        if path == "/action/reset-secret":
+            return self.do_reset_secret()
         if path == "/inbounds/add":
             return self.do_add(form)
         m = re.fullmatch(r"/inbounds/([0-9a-f]{12})/delete", path)
         if m:
             return self.do_delete(m.group(1))
+        m = re.fullmatch(r"/nodes/([A-Za-z0-9._-]{1,48})/delete", path)
+        if m:
+            return self.do_delete_node(m.group(1))
         self.simple(404, "页面不存在", "请检查地址是否正确。")
 
     def do_sub(self, path):
@@ -678,13 +903,50 @@ class Panel(BaseHTTPRequestHandler):
                 if rc != 0:
                     return self.flash("配置校验未通过，未执行重载：" + out[-300:], False)
             rc, out = run([SYSTEMCTL, action, "mihomo"])
-        time.sleep(1)
+            if rc == 0:
+                wait_mihomo_ports()
         _, active = run([SYSTEMCTL, "is-active", "mihomo"])
         state = STATE_ZH.get(active.strip(), (active.strip(), ""))[0]
         if rc == 0:
             self.flash(f"{zh}成功，Mihomo 当前状态：{state}", active.strip() == "active")
         else:
             self.flash(f"{zh}失败：{out[-300:]}（Mihomo 当前状态：{state}）", False)
+
+    def do_reset_secret(self):
+        alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
+        new_secret = "".join(secrets.choice(alphabet) for _ in range(20))
+        with LOCK:
+            old_env = read_env()
+            old_secret = old_env.get("MIHOMO_SECRET", "")
+            files = (FRAG_CONTROLLER, CONF)
+            backup = {}
+            for p in files:
+                try:
+                    with open(p) as f:
+                        backup[p] = f.read()
+                except FileNotFoundError:
+                    backup[p] = None
+            try:
+                write_env_var("MIHOMO_SECRET", new_secret)
+                env = read_env()
+                atomic_write(FRAG_CONTROLLER, render_controller_fragment(env), 0o640)
+                atomic_write(CONF, assemble_config(), 0o640)
+                rc, out = validate_config()
+                if rc != 0:
+                    raise RuntimeError("配置校验失败（mihomo -t）：" + out[-300:])
+                rc, out = run([SYSTEMCTL, "restart", "mihomo"])
+                if rc != 0:
+                    raise RuntimeError("重启失败：" + out[-300:])
+                wait_mihomo_ports()
+            except Exception as e:
+                if old_secret:
+                    write_env_var("MIHOMO_SECRET", old_secret)
+                for p, data in backup.items():
+                    if data is not None:
+                        atomic_write(p, data, 0o640)
+                run([SYSTEMCTL, "restart", "mihomo"])
+                return self.flash(f"重置密钥失败：{e}", False)
+        self.flash("已重置 Zashboard API 密钥，Mihomo 已重启生效。")
 
     def do_cert_action(self):
         with LOCK:
@@ -716,6 +978,18 @@ class Panel(BaseHTTPRequestHandler):
             except Exception as e:
                 return self.flash(f"删除失败：{e}", False)
         self.flash("入站已删除")
+
+    def do_delete_node(self, name):
+        with LOCK:
+            cur = read_nodes()
+            new = [n for n in cur if n["name"] != name]
+            if len(new) == len(cur):
+                return self.flash("入站不存在或已删除", False)
+            try:
+                apply_nodes(new)
+            except Exception as e:
+                return self.flash(f"删除失败：{e}", False)
+        self.flash(f"已删除入站「{name}」")
 
     # -- views
     def login_page(self, err=""):
@@ -799,8 +1073,10 @@ placeholder="请输入面板密码" required autofocus></div>
                 "证书即将到期，自动续期尚未成功（正常情况下到期前 30 天就会续期）。"
                 "请检查配置后点击下方按钮或在服务器执行 clashserver cert 查看原因。")
         hint = f"<div class=notice>{e(tls_hint)}</div>" if tls_hint else ""
+        pport = int(self.cfg.get("port") or env.get("PANEL_PORT") or 8443)
         tls = f"""<div class=card><div class=card-h><h2>域名与证书</h2><span class='pill {tls_cls}'>{e(tls_txt)}</span></div>
 <dl class=kv><dt>面板地址</dt><dd class=mono>{e(panel_base_url(env, self.cfg) or '—')}</dd>
+<dt>面板端口</dt><dd class=mono>{pport}（随机高端口）</dd>
 <dt>申请方式</dt><dd>{e(cert_mode_zh)}</dd>
 <dt>服务器 IP</dt><dd class=mono>{e(env.get('SERVER_IP', '—'))}</dd>{cert_rows}</dl>{hint}
 <div class=row style=margin-top:14px>
@@ -826,9 +1102,10 @@ placeholder="请输入面板密码" required autofocus></div>
 
         rows = []
         for idx, n in enumerate(nodes):
+            acts = (f"<form class=inline method=post action=/nodes/{quote(n['name'])}/delete>{hid}"
+                    f"<button class='btn sm danger' onclick=\"return confirm('确定删除入站「{e(n['name'])}」？删除后客户端将无法连接。')\">删除</button></form>")
             rows.append(item(n["name"], "vless-reality", n["port"], "<span>安装时生成</span>",
-                             "<span class='pill gray' title='安装时生成的节点不能在面板删除'>系统节点</span>",
-                             f"r-{idx}", reality_client(n, env)))
+                             acts, f"r-{idx}", reality_client(n, env)))
         for i in inbs:
             created = time.strftime("%Y-%m-%d %H:%M", time.localtime(i.get("created", 0))) if i.get("created") else ""
             acts = (f"<form class=inline method=post action=/inbounds/{i['id']}/delete>{hid}"
@@ -848,17 +1125,39 @@ placeholder="请输入面板密码" required autofocus></div>
 
         # --- add form
         opts = "".join(f"<option value={k}>{v}</option>" for k, v in KIND_ZH.items())
+        ss_opts = "".join(f"<option value={c}>{c}{'（默认）' if c == 'aes-128-gcm' else ''}</option>" for c in SS_CIPHERS)
         no_cert = "" if certs_present() else "<div class=notice>证书文件缺失，暂时无法添加 Hysteria2 / TrustTunnel（请在服务器执行 clashserver cert）。</div>"
         add = f"""<div class=card><div class=card-h><h2>添加入站</h2></div>
 <form method=post action=/inbounds/add data-busy=正在添加…>{hid}<div class=form-grid>
 <div><label for=kind>协议类型</label><select id=kind name=kind>{opts}</select></div>
 <div><label for=port>端口</label><input id=port name=port inputmode=numeric placeholder="留空则随机分配"></div>
 <div><label for=nm>名称</label><input id=nm name=name placeholder="留空则自动生成"></div>
+<div data-kind=shadowsocks><label>Shadowsocks 加密方式</label><select name=ss_cipher>{ss_opts}</select></div>
 <div data-kind=snell><label>Snell 版本</label><select name=snell_version><option value=5>v5</option><option value=4>v4</option></select></div>
 <div data-kind=trusttunnel><label>TrustTunnel 用户名</label><input name=tt_user placeholder="默认 user"></div>
 </div><button class='btn primary'>添加入站</button></form>
-<p class=hint>密码、UUID、密钥均自动随机生成；Hysteria2 / TrustTunnel 使用本机域名证书（与面板共用，自动续期），Snell / Reality 无需证书。
+<p class=hint>密码、UUID、密钥均自动随机生成；Hysteria2 / TrustTunnel 使用本机域名证书（与面板共用，自动续期），Shadowsocks / Snell / Reality 无需证书。
 保存前会自动校验配置，校验失败会自动回滚，不影响现有节点。</p>{no_cert}</div>"""
+
+        # --- zashboard card
+        zb_url = zashboard_url(env)
+        zb_connect = zashboard_connect_url(env)
+        zb_secret = env.get("MIHOMO_SECRET", "")
+        cport = int(env.get("CONTROLLER_PORT") or 7896)
+        zb_state = ("<span class='pill ok'><span class='dot ok'></span>监听中</span>" if cport in listening
+                    else "<span class='pill warn'>未监听</span>")
+        open_zb = (f"<a class='btn sm primary' href='{e(zb_connect)}' target=_blank rel=noopener>打开 Zashboard ↗</a>"
+                   if zb_connect else "")
+        reset_zb = (f"<form class=inline method=post action=/action/reset-secret data-busy=正在重置…>"
+                    f"{hid}<button class='btn sm' onclick=\"return confirm('确定重置 Zashboard API 密钥？重置后需使用新密钥连接。')\">重置 API 密钥</button></form>")
+        zashboard = f"""<div class=card><div class=card-h><h2>Mihomo 控制面板（Zashboard）</h2>{zb_state}<div class=spacer></div>{open_zb}{reset_zb}
+<div class=desc>用于管理 Mihomo 出站节点、策略组与分流规则（external-controller-tls :{cport}）。点击右上角「打开 Zashboard」可自动带入地址与密钥连接，也可手动复制下方信息。</div></div>
+<div style=margin-bottom:12px><label>Zashboard HTTPS 地址</label>
+<div class=sub-box><div class='url mono' id=zb-url>{e(zb_url or '—')}</div>
+<button type=button class=btn onclick="copyText('zb-url',this)">复制地址</button></div></div>
+<div><label>API 密钥（Secret）</label>
+<div class=sub-box><div class='url mono' id=zb-secret>{e(zb_secret or '—')}</div>
+<button type=button class=btn onclick="copyText('zb-secret',this)">复制密钥</button></div></div></div>"""
 
         url = self.sub_url()
         if url:
@@ -878,7 +1177,7 @@ placeholder="请输入面板密码" required autofocus></div>
         head = f"""<div class=page-h><div><h1>控制台</h1><p>{e(env.get('DOMAIN', ''))}</p></div>
 <a class='btn sm' href=/>刷新</a></div>"""
         return page("控制台 · Clash Serve",
-                    f"{top}<main>{fl}{head}{stats}<div class=grid>{status}{tls}</div>{sub}{inbounds}{add}</main>",
+                    f"{top}<main>{fl}{head}{stats}<div class=grid>{status}{tls}</div>{zashboard}{sub}{inbounds}{add}</main>",
                     scripts=True)
 
 

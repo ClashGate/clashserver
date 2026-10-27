@@ -24,6 +24,7 @@ clashserver —— Mihomo 代理服务端管理命令
   reset-sub         更换订阅链接，旧链接立即失效
   passwd            修改面板密码（自定义）
   reset-password    重置面板密码（随机生成）
+  reset-secret      重置 Zashboard API 密钥（随机生成）
   cert              立即申请 / 续期证书（自动证书模式，平时自动续期）
   restart           重启 Mihomo
   update            更新 Mihomo 内核 + clashserver 自身（update core / update self 只更新其一）
@@ -80,11 +81,8 @@ interactive_setup() {
     done
   fi
   ((menu)) || return 0   # 开发用隐藏参数 -d 启动时不再追问
-  while :; do
-    p=$(ask "请输入管理面板 HTTPS 端口（回车默认 $PANEL_PORT）：" "$PANEL_PORT")
-    if [[ $p =~ ^[0-9]+$ ]] && ((p >= 1 && p <= 65535)); then PANEL_PORT=$p; break; fi
-    printf '请输入 1-65535 之间的端口号\n'
-  done
+  [[ -n $PANEL_PORT ]] || PANEL_PORT=$(rand_port)
+  printf '已分配管理面板随机空闲高端口：%s\n' "$PANEL_PORT"
   if [[ -z $EMAIL ]]; then EMAIL=$(ask '证书通知邮箱（可选，回车跳过）：' ''); fi
   return 0
 }
@@ -112,11 +110,13 @@ verify() {
     info "监听中：$name :$port"
   done < "$STATE"
   [[ $MODE == auto-cert ]] || return 0
+  ss -ltn | grep -q ":${CONTROLLER_PORT:-7896} " || die "Mihomo 控制接口未在端口 ${CONTROLLER_PORT:-7896} 监听"
+  info "Zashboard：$(zashboard_url) 正常"
   local i h p
   h=$(panel_host); p=$(panel_port)
   for ((i = 0; i < 10; i++)); do panel_https_ok /healthz >/dev/null && break; sleep 1; done
   ((i < 10)) || { journalctl -u clashserve -n 20 --no-pager >&2; die "面板未在 $p 端口响应 HTTPS"; }
-  info "面板：$(panel_url) 正常（面板自身 HTTPS，证书与 Mihomo 共用）"
+  info "面板：$(panel_url)（端口 $p）正常（面板自身 HTTPS，证书与 Mihomo 共用）"
   panel_https_ok "/sub/$SUB_TOKEN/mihomo.yaml" | grep -q '^proxies:' || die "订阅接口没有返回 mihomo 配置"
   [[ $(curl -sk -o /dev/null -w '%{http_code}' --resolve "$h:$p:127.0.0.1" \
     "$(panel_url)/sub/wrongtoken0000000000000000/mihomo.yaml") == 404 ]] || die "订阅接口未拒绝错误的 token"
@@ -129,6 +129,7 @@ print_summary() {
   if [[ $MODE == auto-cert ]]; then
     [[ ${CERT_MODE:-port} == port ]] && printf ' 80'
     [[ $PANEL_PORT == 80 && ${CERT_MODE:-port} == port ]] || printf ' %s' "$PANEL_PORT"
+    printf ' %s' "${CONTROLLER_PORT:-7896}"
   fi
   awk -F'\t' '{printf " %s", $2}' "$STATE"; printf '\n'
   if [[ $MODE == auto-cert ]]; then
@@ -136,10 +137,12 @@ print_summary() {
     printf '  \033[1;36m%s\033[0m\n' "$(sub_url)"
     [[ $TLS == production ]] || printf '  注意：当前为%s，客户端可能拒绝下载订阅\n' "$(tls_label)"
     printf '\n\033[1m管理面板\033[0m\n'
-    printf '  地址：%s\n  用户名：admin\n' "$(panel_url)"
+    printf '  地址：%s\n  端口：%s（随机空闲高端口，请确保防火墙已放行 TCP %s）\n  用户名：admin\n' "$(panel_url)" "$(panel_port)" "$(panel_port)"
     [[ -n $PANEL_PASS ]] && printf '  密码：%s（仅显示一次；可用 clashserver passwd 修改）\n' "$PANEL_PASS"
     printf '  申请方式：%s\n' "$(cert_mode_label)"
     printf '  证书：%s\n' "$(tls_label)"
+    printf '\n\033[1mMihomo 控制面板（Zashboard）\033[0m\n'
+    printf '  地址：%s\n  API 密钥（Secret）：%s\n' "$(zashboard_url)" "$MIHOMO_SECRET"
     if cert_is_temp; then printf '  \033[1;33m证书尚未签发成功，当前为临时自签证书；检查配置后可执行 clashserver cert 立即重试\033[0m\n'; fi
     printf '\n本地客户端配置备份：%s\n' "$CLIENT_DIR"
   else
@@ -171,10 +174,15 @@ do_install() {
   [[ $MODE == auto-cert ]] && preflight_cert
   detect_ip
   if [[ $MODE == auto-cert ]]; then check_dns; fi   # 尽早检查，解析不对可在装任何东西前退出
+  [[ $MODE == auto-cert && -z $MIHOMO_SECRET ]] && MIHOMO_SECRET=$(openssl rand -base64 32 | tr -dc 'A-Za-z0-9' | head -c 20)
   save_env
-  install_core; ensure_user; log "安装 clashserver 文件"; install_files; gen_nodes; render_server; render_client; setup_service
+  install_core; ensure_user; log "安装 clashserver 文件"; install_files; gen_nodes
   if [[ $MODE == auto-cert ]]; then
-    install_acme; issue_cert; setup_panel
+    install_acme; issue_cert
+  fi
+  render_server; render_client; setup_service
+  if [[ $MODE == auto-cert ]]; then
+    setup_panel
   fi
   open_firewall
   verify
@@ -218,6 +226,8 @@ update_self() {
   fi
   # 用新模板重新组装配置；校验失败则回滚
   cp -a "$CONF" "$CONF.bak"
+  render_controller
+  save_env
   assemble_config
   if validate_conf; then rm -f "$CONF.bak"; else mv -f "$CONF.bak" "$CONF"; warn "新模板生成的配置未通过校验，已保留原配置"; fi
   info "clashserver 已更新到 GitHub main 最新版"
@@ -244,7 +254,8 @@ do_status() {
   printf '  安装模式：%s\n' "$([[ $MODE == auto-cert ]] && echo "自动证书模式（$(cert_mode_label)）" || echo '无证书模式')"
   printf '  Mihomo：%s  %s\n' "$(svc_state mihomo)" "$("$BIN" -v 2>/dev/null | head -n1 | awk '{print $3}')"
   if [[ $MODE == auto-cert ]]; then
-    printf '  面板：%s（%s）    证书自动续期：%s\n' "$(svc_state clashserve)" "$(panel_url)" "$(svc_state clashserver-cert.timer)"
+    printf '  面板：%s（%s，端口 %s）    证书自动续期：%s\n' "$(svc_state clashserve)" "$(panel_url)" "$(panel_port)" "$(svc_state clashserver-cert.timer)"
+    printf '  Zashboard：%s（端口 %s，API 密钥：%s）\n' "$(zashboard_url)" "${CONTROLLER_PORT:-7896}" "${MIHOMO_SECRET:-—}"
     printf '  域名：%s（证书：%s）\n' "$DOMAIN" "$(tls_label)"
     if cert_is_temp; then
       printf '  证书：\033[1;31m尚未签发\033[0m（临时自签证书；可执行 clashserver cert 重试）\n'
@@ -262,9 +273,10 @@ do_status() {
   printf '  节点端口：\n'
   local name port rest
   while IFS=$'\t' read -r name port rest; do
-    if ss -ltn | grep -q ":$port "; then printf '    %-18s %-6s \033[1;32m监听中\033[0m\n' "$name" "$port"
+    [[ -n $name ]] || continue
+    if ss -ltun | grep -q ":$port "; then printf '    %-18s %-6s \033[1;32m监听中\033[0m\n' "$name" "$port"
     else printf '    %-18s %-6s \033[1;31m未监听\033[0m\n' "$name" "$port"; fi
-  done < "$STATE"
+  done < <(cat "$STATE" 2>/dev/null; jq -r '.[] | "\(.name)\t\(.port)"' "$CS_ETC/inbounds.json" 2>/dev/null)
 }
 
 do_info() {
@@ -274,12 +286,19 @@ do_info() {
   detect_ip
   echo "proxies:"
   while IFS=$'\t' read -r name port uuid priv pub sid sni; do
+    [[ -n $name ]] || continue
     echo "    - $(proxy_line "$name" "$port" "$uuid" "$pub" "$sid" "$sni")"
   done < "$STATE"
+  if [[ -f $CS_ETC/inbounds.json ]]; then
+    jq -rc '.[] | .client' "$CS_ETC/inbounds.json" 2>/dev/null | while IFS= read -r c; do
+      [[ -n $c ]] && echo "    - $c"
+    done
+  fi
   printf '客户端配置目录：%s\n' "$CLIENT_DIR"
   if [[ $MODE == auto-cert ]]; then
     SUB_TOKEN=$(panel_cfg_get sub_token)
-    printf '管理面板：%s（用户名 admin）\n' "$(panel_url)"
+    printf '管理面板：%s（端口 %s，用户名 admin）\n' "$(panel_url)" "$(panel_port)"
+    printf 'Zashboard：%s（端口 %s，API 密钥：%s）\n' "$(zashboard_url)" "${CONTROLLER_PORT:-7896}" "${MIHOMO_SECRET:-—}"
     [[ -n $SUB_TOKEN ]] && printf '订阅链接：%s\n' "$(sub_url)"
   fi
   return 0
@@ -328,6 +347,18 @@ do_reset_password() {
   printf '管理面板：%s\n用户名：admin\n新密码：%s\n' "$(panel_url)" "$PANEL_PASS"
 }
 
+do_reset_secret() {
+  require_installed; load_env; require_panel
+  MIHOMO_SECRET=$(openssl rand -base64 32 | tr -dc 'A-Za-z0-9' | head -c 20)
+  save_env
+  render_controller
+  assemble_config
+  validate_conf || die "当前配置未通过校验（mihomo -t），未重启"
+  systemctl restart mihomo
+  sleep 1
+  printf 'Zashboard：%s\n新的 API 密钥（Secret）：%s\n' "$(zashboard_url)" "$MIHOMO_SECRET"
+}
+
 do_restart() {
   require_installed
   validate_conf || die "当前配置未通过校验（mihomo -t），未重启"
@@ -349,8 +380,8 @@ do_menu() {
   local items=() labels=() i c
   items+=(status info);          labels+=("查看运行状态" "查看节点配置")
   if [[ $MODE == auto-cert ]]; then
-    items+=(sub reset-sub passwd reset-password cert)
-    labels+=("查看订阅链接" "更换订阅链接" "修改面板密码（自定义）" "重置面板密码（随机）" "立即申请 / 续期证书")
+    items+=(sub reset-sub passwd reset-password reset-secret cert)
+    labels+=("查看订阅链接" "更换订阅链接" "修改面板密码（自定义）" "重置面板密码（随机）" "重置 Zashboard 密钥（随机）" "立即申请 / 续期证书")
   fi
   items+=(restart log update uninstall); labels+=("重启 Mihomo" "查看日志" "更新（内核 + 脚本）" "卸载")
   while :; do
@@ -395,7 +426,7 @@ do_uninstall() {
 ACTION=""
 while (($#)); do
   case "$1" in
-    install|update|uninstall|info|status|sub|passwd|restart|log|menu|reset-password|reset-sub|cert) ACTION=$1 ;;
+    install|update|uninstall|info|status|sub|passwd|restart|log|menu|reset-password|reset-secret|reset-sub|cert) ACTION=$1 ;;
     core|self) [[ $ACTION == update ]] || die "未知参数：$1"; UPDATE_WHAT=$1 ;;
     help) usage; exit 0 ;;
     # 以下为开发/测试用隐藏参数，不写入用户文档

@@ -59,7 +59,7 @@ rand_port() {
   while :; do
     p=$((RANDOM % 20000 + 20000))
     grep -q "	$p	" "$STATE" 2>/dev/null && continue
-    [[ $p == "$PANEL_PORT" ]] && continue
+    [[ $p == "$PANEL_PORT" || $p == "${CONTROLLER_PORT:-7896}" ]] && continue
     ss -ltun 2>/dev/null | grep -q ":$p " && continue
     echo "$p"; return
   done
@@ -88,16 +88,51 @@ gen_nodes() {
 validate_conf() {
   local d rc=0
   d=$(mktemp -d)
+  mkdir -p "$d/ui"   # 避免 mihomo -t 校验时临时下载 external-ui
   SAFE_PATHS=$CONF_DIR "$BIN" -t -d "$d" -f "$CONF" >/dev/null || rc=$?
   rm -rf "$d"
   return "$rc"
 }
 
-# config.yaml = template with @@LISTENERS@@ <- reality fragment + panel (extra) fragment.
+ensure_mihomo_secret() {
+  [[ $MODE == auto-cert ]] || return 0
+  if [[ -z ${MIHOMO_SECRET:-} ]]; then
+    MIHOMO_SECRET=$(openssl rand -base64 32 | tr -dc 'A-Za-z0-9' | head -c 20)
+    save_env
+  fi
+}
+
+render_controller() {
+  if [[ $MODE == auto-cert ]]; then
+    ensure_mihomo_secret
+    [[ -f $CONF_DIR/certs/fullchain.pem && -f $CONF_DIR/certs/privkey.pem ]] \
+      || "$LIB_DIR/scripts/certctl.sh" selfsign >/dev/null
+    cat > "$FRAG_CONTROLLER" <<EOF
+external-controller-tls: "0.0.0.0:${CONTROLLER_PORT:-7896}"
+tls:
+  certificate: $CONF_DIR/certs/fullchain.pem
+  private-key: $CONF_DIR/certs/privkey.pem
+external-controller-cors:
+  allow-origins:
+    - '*'
+  allow-private-network: true
+secret: "$MIHOMO_SECRET"
+external-ui: ui
+external-ui-url: "https://github.com/Zephyruso/zashboard/releases/latest/download/dist-cdn-fonts.zip"
+EOF
+  else
+    echo "# No external-controller in no-cert mode." > "$FRAG_CONTROLLER"
+  fi
+  chmod 640 "$FRAG_CONTROLLER"; chown root:mihomo "$FRAG_CONTROLLER"
+}
+
+# config.yaml = template with @@CONTROLLER@@ and @@LISTENERS@@ <- reality fragment + panel (extra) fragment.
 # Mirrors assemble_config() in panel/panel.py.
 assemble_config() {
-  awk -v r="$FRAG_REALITY" -v e="$FRAG_EXTRA" '
-    /^@@LISTENERS@@$/ { while ((getline l < r) > 0) print l; while ((getline l < e) > 0) print l; next }
+  [[ -f $FRAG_CONTROLLER ]] || render_controller
+  awk -v c="$FRAG_CONTROLLER" -v r="$FRAG_REALITY" -v e="$FRAG_EXTRA" '
+    /^@@CONTROLLER@@$/ { while ((getline l < c) > 0) print l; next }
+    /^@@LISTENERS@@$/  { while ((getline l < r) > 0) print l; while ((getline l < e) > 0) print l; next }
     { print }' "$LIB_DIR/resources/server.yaml.tpl" > "$CONF.new"
   chmod 640 "$CONF.new"; chown root:mihomo "$CONF.new"
   mv -f "$CONF.new" "$CONF"
@@ -105,6 +140,7 @@ assemble_config() {
 
 render_server() {
   log "写入服务端配置"
+  render_controller
   local listeners="" name port uuid priv pub sid sni
   while IFS=$'\t' read -r name port uuid priv pub sid sni; do
     listeners+="  - name: $name
@@ -139,12 +175,20 @@ proxy_line() { # name port uuid pub sid sni
 
 render_client() {
   log "生成客户端配置"
-  local proxies="" names="" name port uuid priv pub sid sni line
+  local proxies="" names="" name port uuid priv pub sid sni line cname
   while IFS=$'\t' read -r name port uuid priv pub sid sni; do
+    [[ -n $name ]] || continue
     line=$(proxy_line "$name" "$port" "$uuid" "$pub" "$sid" "$sni")
     proxies+="    - $line"$'\n'
     names+="      - \"$VPS_NAME-$name|Clash|Reality\""$'\n'
   done < "$STATE"
+  if [[ -f $CS_ETC/inbounds.json ]]; then
+    while IFS=$'\t' read -r line cname; do
+      [[ -n $line ]] || continue
+      proxies+="    - $line"$'\n'
+      names+="      - $cname"$'\n'
+    done < <(jq -r '.[] | "\(.client | tojson)\t\(.client.name | tojson)"' "$CS_ETC/inbounds.json" 2>/dev/null || true)
+  fi
   install -d -m 700 "$CLIENT_DIR"
   awk -v p="${proxies%$'\n'}" -v n="${names%$'\n'}" \
     '/^@@PROXIES@@$/{print p; next} /^@@PROXY_NAMES@@$/{print n; next} {print}' \
@@ -160,6 +204,7 @@ open_firewall() { # 本机启用了 ufw 时自动放行所需端口（云服务�
   if [[ $MODE == auto-cert ]]; then
     [[ ${CERT_MODE:-port} == port ]] && ports+=(80/tcp)
     [[ $PANEL_PORT == 80 && ${CERT_MODE:-port} == port ]] || ports+=("$PANEL_PORT/tcp")
+    ports+=("${CONTROLLER_PORT:-7896}/tcp")
   fi
   while IFS=$'\t' read -r _ p _; do ports+=("$p/tcp"); done < "$STATE"
   for p in "${ports[@]}"; do ufw allow "$p" >/dev/null 2>&1 || true; done

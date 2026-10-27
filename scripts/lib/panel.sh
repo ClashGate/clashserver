@@ -6,13 +6,19 @@ panel_host() { printf '%s' "${DOMAIN#\*.}"; }
 panel_port() {
   local p=${PANEL_PORT:-}
   [[ -n $p ]] || p=$(panel_cfg_get port)
-  printf '%s' "${p:-8443}"
+  [[ -n $p ]] || p=$(rand_port)
+  PANEL_PORT=$p
+  printf '%s' "$p"
 }
 
 panel_url() {
   local h p
   h=$(panel_host); p=$(panel_port)
   if [[ $p == 443 ]]; then printf 'https://%s' "$h"; else printf 'https://%s:%s' "$h" "$p"; fi
+}
+
+zashboard_url() {
+  printf 'https://%s:%s/ui/' "$(panel_host)" "${CONTROLLER_PORT:-7896}"
 }
 
 setup_panel() {

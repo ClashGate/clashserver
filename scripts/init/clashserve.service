@@ -9,9 +9,6 @@ Type=simple
 ExecStart=/usr/bin/python3 /usr/local/lib/clashserver/panel/panel.py serve --config /etc/clashserver/panel.json
 Restart=on-failure
 RestartSec=3
-ProtectSystem=strict
-ReadWritePaths=/etc/mihomo /etc/clashserver
-ProtectHome=true
 PrivateTmp=true
 NoNewPrivileges=true
 

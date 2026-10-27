@@ -5,10 +5,12 @@
 preflight_cert() {
   [[ -n $DOMAIN ]] || die "自动证书模式需要域名"
   DOMAIN=${DOMAIN,,}
+  [[ -n ${PANEL_PORT:-} ]] || PANEL_PORT=$(rand_port)
   [[ $PANEL_PORT =~ ^[0-9]+$ ]] && ((PANEL_PORT >= 1 && PANEL_PORT <= 65535)) || die "管理面板端口无效：$PANEL_PORT"
+  [[ $PANEL_PORT != "${CONTROLLER_PORT:-7896}" ]] || die "管理面板端口不能与 Mihomo 控制端口（${CONTROLLER_PORT:-7896}）相同"
   local busy
-  busy=$(ss -Hltnp "sport = :$PANEL_PORT" 2>/dev/null || true)
-  [[ -z $busy ]] || die "管理面板端口 $PANEL_PORT 已被占用，请先停止占用程序或更换端口：
+  busy=$(ss -Hltnp "sport = :$PANEL_PORT or sport = :${CONTROLLER_PORT:-7896}" 2>/dev/null || true)
+  [[ -z $busy ]] || die "端口 $PANEL_PORT / ${CONTROLLER_PORT:-7896} 已被占用，请先停止占用程序：
 $busy"
   if [[ ${CERT_MODE:-port} == dns ]]; then
     [[ $DOMAIN =~ $WILDCARD_DOMAIN_RE ]] || die "域名格式不正确：$DOMAIN"

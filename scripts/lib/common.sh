@@ -7,6 +7,7 @@ BIN=/usr/local/bin/mihomo
 CONF_DIR=/etc/mihomo
 CONF=$CONF_DIR/config.yaml
 STATE=$CONF_DIR/nodes.tsv          # name port uuid private pub shortid sni
+FRAG_CONTROLLER=$CONF_DIR/controller.yaml   # external-controller-tls + zashboard (auto-cert mode)
 FRAG_REALITY=$CONF_DIR/listeners.reality.yaml
 FRAG_EXTRA=$CONF_DIR/listeners.extra.yaml   # owned by the panel
 CLIENT_DIR=/root/clashserver-client
@@ -22,9 +23,10 @@ REALITY_SNI=www.sc.com
 DOMAIN_RE='^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$'
 WILDCARD_DOMAIN_RE='^(\*\.)?([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$'
 
-MODE=no-cert MODE_SET=0 NODES=3 VPS_NAME="" SERVER_IP=""   # NODES：固定 3 个 Reality 节点
+MODE=no-cert MODE_SET=0 NODES=1 VPS_NAME="" SERVER_IP=""   # NODES：默认生成 1 个 Reality 节点，更多节点在面板添加
 CERT_MODE=port CERT_MODE_SET=0 CF_TOKEN=""                 # CERT_MODE：port（端口模式）| dns（DNS API 模式）
-DOMAIN="" EMAIL="" TLS=staging PANEL_PORT=8443             # 默认 Let's Encrypt staging；面板默认 8443（不占 443）
+DOMAIN="" EMAIL="" TLS=staging PANEL_PORT=""               # 默认 Let's Encrypt staging；面板端口安装时随机选空闲高端口
+CONTROLLER_PORT=7896 MIHOMO_SECRET=""                      # Mihomo external-controller-tls + zashboard 端口与密钥
 PANEL_PASS="" PANEL_HASH="" SUB_TOKEN="" WARNINGS=()
 STEP=0; TOTAL=8
 
@@ -72,7 +74,7 @@ load_env() { # persisted install settings; CLI flags given this run win
     case "$k" in
       VPS_NAME)   [[ -n $VPS_NAME ]]  || VPS_NAME=$v ;;
       SERVER_IP)  [[ -n $SERVER_IP ]] || SERVER_IP=$v ;;
-      MODE|CERT_MODE|CF_TOKEN|DOMAIN|TLS|EMAIL|PANEL_PORT) printf -v "$k" '%s' "$v" ;;
+      MODE|CERT_MODE|CF_TOKEN|DOMAIN|TLS|EMAIL|PANEL_PORT|CONTROLLER_PORT|MIHOMO_SECRET) printf -v "$k" '%s' "$v" ;;
     esac
   done < "$ENV_FILE"
 }
@@ -89,6 +91,8 @@ DOMAIN="$DOMAIN"
 TLS="$TLS"
 EMAIL="$EMAIL"
 PANEL_PORT="$PANEL_PORT"
+CONTROLLER_PORT="$CONTROLLER_PORT"
+MIHOMO_SECRET="$MIHOMO_SECRET"
 CF_TOKEN="$CF_TOKEN"
 EOF
   # 开发用（不写入用户文档）：指向本地 pebble 等 ACME 测试服务，定时续期也沿用
