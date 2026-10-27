@@ -14,7 +14,7 @@ if [[ -n ${CS_BOOTSTRAP_TMP:-} ]]; then trap 'rm -rf "$CS_BOOTSTRAP_TMP"' EXIT; 
 
 usage() {
   cat <<'EOF'
-clashserver —— Mihomo 代理服务端管理命令 (v0.7)
+clashserver —— Mihomo 代理服务端管理命令 (v0.8)
 
 用法：clashserver [子命令]
   （不带参数）       打开中文交互菜单

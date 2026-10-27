@@ -1,7 +1,7 @@
 # shellcheck shell=bash
 # clashserver 公共函数：常量、日志、交互、环境持久化、下载与安装文件、旧目录迁移
 
-CS_VERSION=0.7
+CS_VERSION=0.8
 REPO_TARBALL=https://github.com/saulsburyroy/clashserver/archive/refs/heads/main.tar.gz
 CS_ROOT=/etc/clashserve
 SELF_BIN=/usr/local/bin/clashserver

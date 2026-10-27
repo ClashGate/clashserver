@@ -255,7 +255,7 @@ render_server() {
 proxy_line() { # name port uuid pub sid sni [enc]
   local enc_part=""
   [[ -n ${7:-} ]] && enc_part=$(printf ',"encryption":"%s"' "$7")
-  printf '{"name":"%s|Clash|Reality","type":"vless","server":"%s","port":%s,"uuid":"%s","tls":true,"flow":"xtls-rprx-vision","client-fingerprint":"safari","skip-cert-verify":false%s,"reality-opts":{"public-key":"%s","short-id":"%s"},"network":"tcp","udp":true,"servername":"%s"}' \
+  printf '{"name":"%s|Clash|Reality","type":"vless","server":"%s","port":%s,"uuid":"%s","tls":true,"flow":"xtls-rprx-vision","client-fingerprint":"safari"%s,"reality-opts":{"public-key":"%s","short-id":"%s"},"network":"tcp","udp":true,"servername":"%s"}' \
     "$1" "$SERVER_IP" "$2" "$3" "$enc_part" "$4" "$5" "$6"
 }
 
@@ -273,13 +273,13 @@ render_client() {
       [[ -n $line ]] || continue
       proxies+="  - $line"$'\n'
       names+="      - $cname"$'\n'
-    done < <(jq -r '.[] | "\(.client | tojson)\t\(.client.name | tojson)"' "$CS_ETC/inbounds.json" 2>/dev/null || true)
+    done < <(jq -r '.[] | "\(.client | del(.["skip-cert-verify"]) | tojson)\t\(.client.name | tojson)"' "$CS_ETC/inbounds.json" 2>/dev/null || true)
   fi
   install -d -m 700 "$CLIENT_DIR"
   p_arg="${proxies%$'\n'}"; [[ -n $p_arg ]] || p_arg="  []"
   n_arg="${names%$'\n'}";   [[ -n $n_arg ]] || n_arg='      - "DIRECT"'
   P="$p_arg" N="$n_arg" awk \
-    '/^@@PROXIES@@$/{print ENVIRON["P"]; next} /^@@PROXY_NAMES@@$/{print ENVIRON["N"]; next} {print}' \
+    '/^@@PROXIES@@$/{print ENVIRON["P"]; next} /^@@PROXY_NAMES@@$/{print ENVIRON["N"]; next} {gsub(/\/dns-query#[^"'\''[:space:]]*/, "/dns-query"); print}' \
     "$LIB_DIR/resources/client.yaml.tpl" > "$CLIENT_DIR/mihomo-client.yaml"
   chmod 600 "$CLIENT_DIR/mihomo-client.yaml"
   { echo "proxies:"; printf '%s' "${proxies:-  []$'\n'}"; } > "$CLIENT_DIR/proxies.yaml"

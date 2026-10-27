@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""clashserve v0.7 - rebuilt admin console for clashserver (Vue 3 + Tailwind CSS).
+"""clashserve v0.8 - rebuilt admin console for clashserver (Vue 3 + Tailwind CSS, light green SaaS theme).
 
 Stdlib only (Python 3). Serves HTTPS itself with the same certificate
 Mihomo uses (/etc/clashserve/certs); no reverse proxy.
@@ -33,7 +33,7 @@ import uuid as uuidlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse, quote
 
-VERSION = "0.7"
+VERSION = "0.8"
 
 # CLASHSERVER_ROOT lets the panel run against a fake tree for local testing.
 ROOT = os.environ.get("CLASHSERVER_ROOT", "")
@@ -100,11 +100,26 @@ DEFAULT_NODE_NAMES = {
     "http": "HTTP",
     "socks": "SOCKS5",
 }
+PROTOCOL_DESCRIPTIONS = {
+    "vless-reality": "免要证书的新一代协议",
+    "shadowsocks": "经典轻量级加密协议，默认锁定 aes-256-gcm",
+    "hysteria2": "新一代 UDP 协议",
+    "snell": "轻量高效的私有协议，内置随机 TLS 伪装",
+    "anytls": "内置随机填充与随机指纹的新一代 TLS 协议",
+    "tuic": "基于 QUIC 的低延迟零握手机制 UDP 协议",
+    "trusttunnel": "基于标准 HTTP/2 与 HTTP/3 的高隐蔽 TLS 隧道协议",
+    "shadowquic": "免证书的新一代 QUIC 协议，内置随机 JLS 伪装",
+    "mieru": "抗深度包检测（DPI）的混淆传输代理协议",
+    "sudoku": "基于数独流量特征变换与 chacha20 加密的抗审查协议",
+    "http": "通用 HTTP / HTTPS 代理协议",
+    "socks": "通用 SOCKS5 代理协议，支持 UDP 转发",
+}
+ANYTLS_FP_POOL = ("chrome", "safari", "firefox", "ios")
 CERT_TYPES = ("hysteria2", "trusttunnel", "anytls", "tuic")
-SS_CIPHERS = ("aes-128-gcm", "aes-256-gcm")
+SS_CIPHERS = ("aes-256-gcm", "aes-128-gcm")
 SS_CIPHER_LABELS = {
-    "aes-128-gcm": "aes-128-gcm（默认）",
-    "aes-256-gcm": "aes-256-gcm",
+    "aes-256-gcm": "aes-256-gcm（默认）",
+    "aes-128-gcm": "aes-128-gcm",
 }
 STR_KEYS = {
     "name", "type", "server", "uuid", "password", "psk", "public-key", "private-key",
@@ -240,12 +255,14 @@ def load_inbounds() -> list:
         with open(INBOUNDS) as f:
             items = json.load(f)
         for item in items:
-            if isinstance(item, dict) and isinstance(item.get("client"), dict) and item.get("name"):
-                nm = str(item["name"])
-                cnm = str(item["client"].get("name", ""))
-                if "|Clash|" in cnm and not cnm.startswith(nm + "|Clash|"):
-                    suffix = cnm.split("|Clash|", 1)[1]
-                    item["client"]["name"] = f"{nm}|Clash|{suffix}"
+            if isinstance(item, dict) and isinstance(item.get("client"), dict):
+                item["client"].pop("skip-cert-verify", None)
+                if item.get("name"):
+                    nm = str(item["name"])
+                    cnm = str(item["client"].get("name", ""))
+                    if "|Clash|" in cnm and not cnm.startswith(nm + "|Clash|"):
+                        suffix = cnm.split("|Clash|", 1)[1]
+                        item["client"]["name"] = f"{nm}|Clash|{suffix}"
         return items
     except FileNotFoundError:
         return []
@@ -1068,7 +1085,6 @@ def listener_to_inbound(lst: dict, env: dict, existing_by_name: dict = None) -> 
 
     ip = env.get("SERVER_IP", "")
     domain = env.get("DOMAIN", "").removeprefix("*.") or ip
-    insecure = env.get("CERT_MODE") != "manual" and env.get("TLS", "") in ("staging", "internal")
     label = name
     has_cert = bool(lst.get("certificate"))
     srv = domain if has_cert else ip
@@ -1092,7 +1108,7 @@ def listener_to_inbound(lst: dict, env: dict, existing_by_name: dict = None) -> 
         client = {
             "name": f"{label}|Clash|Reality", "type": "vless", "server": ip, "port": port,
             "uuid": uid, "tls": True, "flow": flow or "xtls-rprx-vision",
-            "client-fingerprint": "safari", "skip-cert-verify": False,
+            "client-fingerprint": "safari",
         }
         if lst.get("decryption") and str(lst.get("decryption")) != "none":
             enc = ""
@@ -1114,7 +1130,6 @@ def listener_to_inbound(lst: dict, env: dict, existing_by_name: dict = None) -> 
         }
         if has_cert:
             client["servername"] = domain
-            client["skip-cert-verify"] = insecure
             client["client-fingerprint"] = "chrome"
         if isinstance(lst.get("xhttp-config"), dict):
             xcfg = lst["xhttp-config"]
@@ -1146,7 +1161,7 @@ def listener_to_inbound(lst: dict, env: dict, existing_by_name: dict = None) -> 
         kind = "shadowsocks"
         client = {
             "name": f"{label}|Clash|SS", "type": "ss", "server": ip, "port": port,
-            "cipher": str(lst.get("cipher", "aes-128-gcm")),
+            "cipher": str(lst.get("cipher", "aes-256-gcm")),
             "password": str(lst.get("password", pw)), "udp": True,
         }
     elif ltype == "hysteria2":
@@ -1155,7 +1170,7 @@ def listener_to_inbound(lst: dict, env: dict, existing_by_name: dict = None) -> 
         client = {
             "name": f"{label}|Clash|Hy2", "type": "hysteria2", "server": domain, "port": port,
             "password": str(lst.get("password") or pw), "sni": domain, "alpn": alpn,
-            "skip-cert-verify": insecure, "udp": True,
+            "udp": True,
         }
         if lst.get("obfs"):
             client["obfs"] = str(lst["obfs"])
@@ -1167,14 +1182,18 @@ def listener_to_inbound(lst: dict, env: dict, existing_by_name: dict = None) -> 
         client = {
             "name": f"{label}|Clash|Hy2Realm", "type": "hysteria2", "server": domain, "port": port,
             "password": str(lst.get("token") or pw), "sni": domain, "alpn": alpn,
-            "skip-cert-verify": insecure, "udp": True,
+            "udp": True,
         }
     elif ltype == "anytls":
         kind = "anytls"
+        prev_fp = ""
+        if prev and isinstance(prev.get("client"), dict):
+            prev_fp = str(prev["client"].get("client-fingerprint") or "")
+        fp = prev_fp if prev_fp in ANYTLS_FP_POOL else random.choice(ANYTLS_FP_POOL)
         client = {
             "name": f"{label}|Clash|AnyTLS", "type": "anytls", "server": domain, "port": port,
             "password": str(lst.get("password") or pw), "sni": domain,
-            "client-fingerprint": "chrome", "skip-cert-verify": insecure, "udp": True,
+            "client-fingerprint": fp, "udp": True,
         }
     elif ltype == "vmess":
         kind = "vmess"
@@ -1184,7 +1203,6 @@ def listener_to_inbound(lst: dict, env: dict, existing_by_name: dict = None) -> 
         }
         if has_cert:
             client["servername"] = domain
-            client["skip-cert-verify"] = insecure
             client["client-fingerprint"] = "chrome"
         if lst.get("ws-path"):
             wpath = str(lst["ws-path"])
@@ -1198,7 +1216,7 @@ def listener_to_inbound(lst: dict, env: dict, existing_by_name: dict = None) -> 
         client = {
             "name": f"{label}|Clash|TrustTunnel", "type": "trusttunnel", "server": domain,
             "port": port, "username": user, "password": pw, "sni": domain,
-            "skip-cert-verify": insecure, "udp": True,
+            "udp": True,
         }
     elif ltype == "snell":
         kind = "snell"
@@ -1216,12 +1234,12 @@ def listener_to_inbound(lst: dict, env: dict, existing_by_name: dict = None) -> 
             "name": f"{label}|Clash|TUICv5", "type": "tuic", "server": domain, "port": port,
             "uuid": uid, "password": pw, "sni": domain, "alpn": alpn,
             "congestion-controller": cc, "udp-relay-mode": "native",
-            "reduce-rtt": True, "skip-cert-verify": insecure, "udp": True,
+            "reduce-rtt": True, "udp": True,
         }
-    elif ltype == "shadowquic":
+    elif ltype in ("shadowquic", "shadowqiuc"):
         kind = "shadowquic"
         jls_up = lst.get("jls-upstream") if isinstance(lst.get("jls-upstream"), dict) else {}
-        jls_addr = str(jls_up.get("addr") or "www.microsoft.com:443")
+        jls_addr = str(jls_up.get("addr") or f"{pick_reality_sni()}:443")
         jls_host = jls_addr.rsplit(":", 1)[0]
         cc = str(lst.get("congestion-controller") or "bbr")
         zrtt = bool(lst.get("zero-rtt", True))
@@ -1237,7 +1255,7 @@ def listener_to_inbound(lst: dict, env: dict, existing_by_name: dict = None) -> 
             "name": f"{label}|Clash|Mieru", "type": "mieru", "server": ip, "port": port,
             "transport": tr, "username": user, "password": pw, "udp": True,
         }
-    elif ltype == "sudoku":
+    elif ltype in ("sudoku", "soduku"):
         kind = "sudoku"
         priv_k = str(lst.get("key", ""))
         if prev and isinstance(prev.get("client"), dict) and prev["client"].get("key"):
@@ -1257,7 +1275,6 @@ def listener_to_inbound(lst: dict, env: dict, existing_by_name: dict = None) -> 
         }
         if has_cert:
             client["sni"] = domain
-            client["skip-cert-verify"] = insecure
     else:  # socks, socks5, mixed
         kind = "mixed" if ltype == "mixed" else "socks"
         tag = "Mixed" if ltype == "mixed" else "SOCKS5"
@@ -1265,8 +1282,6 @@ def listener_to_inbound(lst: dict, env: dict, existing_by_name: dict = None) -> 
             "name": f"{label}|Clash|{tag}", "type": "socks5", "server": srv, "port": port,
             "username": user, "password": pw, "tls": has_cert, "udp": True,
         }
-        if has_cert:
-            client["skip-cert-verify"] = insecure
 
     return {
         "id": iid, "kind": kind, "port": port, "name": name,
@@ -1317,6 +1332,10 @@ def parse_custom_config_state(raw_yaml: str, env: dict = None) -> tuple:
 
 # ---------------------------------------------------------------- inbound model
 def build_inbound(kind: str, form: dict, env: dict) -> dict:
+    if kind == "shadowqiuc":
+        kind = "shadowquic"
+    elif kind == "soduku":
+        kind = "sudoku"
     if kind not in TYPES:
         raise ValueError("未知的入站类型")
     need_cert = kind in CERT_TYPES
@@ -1345,35 +1364,27 @@ def build_inbound(kind: str, form: dict, env: dict) -> dict:
         raise ValueError(f"入站名称「{name}」已存在")
     ip = env.get("SERVER_IP", "")
     domain = env.get("DOMAIN", "").removeprefix("*.") or ip
-    insecure = env.get("CERT_MODE") != "manual" and env.get("TLS", "") in ("staging", "internal")
     base = {"name": name, "port": port, "listen": "0.0.0.0"}
     label = name
 
     if kind == "vless-reality":
-        sni = (form.get("reality_sni") or "").strip() or pick_reality_sni()
-        if not re.fullmatch(r"[A-Za-z0-9.-]{1,128}", sni):
-            raise ValueError("Reality 伪装域名（SNI）格式无效")
-        use_enc = (form.get("reality_enc") or "x25519").strip() != "none"
+        sni = pick_reality_sni()
         priv, pub = reality_keypair()
         uid, sid = str(uuidlib.uuid4()), secrets.token_hex(4)
+        dec, enc = vless_x25519_keypair()
         listener = {**base, "type": "vless", "udp": True,
-                    "users": [{"username": "user", "uuid": uid, "flow": "xtls-rprx-vision"}]}
+                    "users": [{"username": "user", "uuid": uid, "flow": "xtls-rprx-vision"}],
+                    "decryption": dec,
+                    "reality-config": {"dest": f"{sni}:443", "private-key": priv,
+                                       "short-id": [sid], "server-names": [sni]}}
         client = {"name": f"{label}|Clash|Reality", "type": "vless", "server": ip, "port": port,
                   "uuid": uid, "tls": True, "flow": "xtls-rprx-vision", "client-fingerprint": "safari",
-                  "skip-cert-verify": False}
-        if use_enc:
-            dec, enc = vless_x25519_keypair()
-            listener["decryption"] = dec
-            client["encryption"] = enc
-        listener["reality-config"] = {"dest": f"{sni}:443", "private-key": priv,
-                                      "short-id": [sid], "server-names": [sni]}
-        client.update({"reality-opts": {"public-key": pub, "short-id": sid},
-                       "network": "tcp", "udp": True, "servername": sni})
+                  "encryption": enc,
+                  "reality-opts": {"public-key": pub, "short-id": sid},
+                  "network": "tcp", "udp": True, "servername": sni}
 
     elif kind == "shadowsocks":
-        cipher = (form.get("ss_cipher") or "aes-128-gcm").strip()
-        if cipher not in SS_CIPHERS:
-            raise ValueError("不支持的 Shadowsocks 加密方式（仅支持 aes-128-gcm 与 aes-256-gcm）")
+        cipher = "aes-256-gcm"
         pw = secrets.token_urlsafe(16)
         listener = {"name": name, "type": "shadowsocks", "udp": True, "port": port,
                     "listen": "0.0.0.0", "password": pw, "cipher": cipher}
@@ -1382,25 +1393,19 @@ def build_inbound(kind: str, form: dict, env: dict) -> dict:
 
     elif kind == "hysteria2":
         pw = secrets.token_urlsafe(18)
-        obfs_pw = (form.get("hy2_obfs_pw") or "").strip()
+        obfs_pw = secrets.token_urlsafe(16)
         listener = {**base, "type": "hysteria2", "users": {"user": pw},
                     "certificate": CERT, "private-key": KEY, "alpn": ["h3"],
-                    "ignore-client-bandwidth": False}
+                    "ignore-client-bandwidth": False,
+                    "obfs": "salamander", "obfs-password": obfs_pw}
         client = {"name": f"{label}|Clash|Hy2", "type": "hysteria2", "server": domain, "port": port,
-                  "password": pw, "sni": domain, "alpn": ["h3"], "skip-cert-verify": insecure,
-                  "udp": True}
-        if obfs_pw:
-            listener["obfs"] = "salamander"
-            listener["obfs-password"] = obfs_pw
-            client["obfs"] = "salamander"
-            client["obfs-password"] = obfs_pw
+                  "password": pw, "sni": domain, "alpn": ["h3"],
+                  "obfs": "salamander", "obfs-password": obfs_pw, "udp": True}
 
     elif kind == "snell":
         version = 5
-        obfs_mode = (form.get("snell_obfs") or "tls").strip()
-        if obfs_mode not in ("tls", "http"):
-            obfs_mode = "tls"
-        obfs_host = (form.get("snell_host") or "").strip() or pick_reality_sni()
+        obfs_mode = "tls"
+        obfs_host = pick_reality_sni()
         psk = base64.b64encode(secrets.token_bytes(16)).decode()
         listener = {**base, "type": "snell", "psk": psk, "version": version, "udp": True,
                     "obfs-opts": {"mode": obfs_mode, "host": obfs_host}}
@@ -1421,11 +1426,11 @@ def build_inbound(kind: str, form: dict, env: dict) -> dict:
                     "congestion-controller": cc}
         client = {"name": f"{label}|Clash|TrustTunnel", "type": "trusttunnel", "server": domain,
                   "port": port, "username": user, "password": pw, "sni": domain,
-                  "skip-cert-verify": insecure, "udp": True}
+                  "udp": True}
 
     elif kind == "http":
         user = (form.get("http_user") or "user").strip()
-        pw = (form.get("http_pass") or "").strip() or secrets.token_urlsafe(14)
+        pw = secrets.token_urlsafe(14)
         use_tls = form.get("http_tls") == "1"
         listener = {**base, "type": "http", "users": [{"username": user, "password": pw}]}
         if use_tls:
@@ -1436,11 +1441,10 @@ def build_inbound(kind: str, form: dict, env: dict) -> dict:
                   "username": user, "password": pw, "tls": use_tls, "udp": True}
         if use_tls:
             client["sni"] = domain
-            client["skip-cert-verify"] = insecure
 
     elif kind == "socks":
         user = (form.get("socks_user") or "user").strip()
-        pw = (form.get("socks_pass") or "").strip() or secrets.token_urlsafe(14)
+        pw = secrets.token_urlsafe(14)
         use_tls = form.get("socks_tls") == "1"
         listener = {**base, "type": "socks", "udp": True, "users": [{"username": user, "password": pw}]}
         if use_tls:
@@ -1449,21 +1453,17 @@ def build_inbound(kind: str, form: dict, env: dict) -> dict:
         client = {"name": f"{label}|Clash|SOCKS5", "type": "socks5",
                   "server": domain if use_tls else ip, "port": port,
                   "username": user, "password": pw, "tls": use_tls, "udp": True}
-        if use_tls:
-            client["skip-cert-verify"] = insecure
 
     elif kind == "anytls":
         user = (form.get("anytls_user") or "user").strip() or "user"
-        fp = (form.get("anytls_fp") or "chrome").strip()
-        if fp not in ("chrome", "safari", "firefox", "ios"):
-            fp = "chrome"
+        fp = random.choice(ANYTLS_FP_POOL)
         pw = secrets.token_urlsafe(18)
         listener = {**base, "type": "anytls", "users": {user: pw},
                     "certificate": CERT, "private-key": KEY,
                     "padding-scheme": random_anytls_padding()}
         client = {"name": f"{label}|Clash|AnyTLS", "type": "anytls", "server": domain, "port": port,
                   "password": pw, "sni": domain, "client-fingerprint": fp,
-                  "skip-cert-verify": insecure, "udp": True}
+                  "udp": True}
 
     elif kind == "mieru":
         user = (form.get("mieru_user") or "user").strip() or "user"
@@ -1476,13 +1476,9 @@ def build_inbound(kind: str, form: dict, env: dict) -> dict:
                   "transport": transport, "username": user, "password": pw, "udp": True}
 
     elif kind == "sudoku":
-        aead = (form.get("sudoku_aead") or "chacha20-poly1305").strip()
-        if aead not in ("chacha20-poly1305", "aes-128-gcm", "none"):
-            aead = "chacha20-poly1305"
-        table = (form.get("sudoku_table") or "prefer_ascii").strip()
-        if table not in ("prefer_ascii", "prefer_entropy", "up_ascii_down_entropy", "up_entropy_down_ascii"):
-            table = "prefer_ascii"
-        pure_dl = form.get("sudoku_pure_downlink", "1") == "1"
+        aead = "chacha20-poly1305"
+        table = "prefer_ascii"
+        pure_dl = True
         priv_k, pub_k = sudoku_keypair()
         listener = {**base, "type": "sudoku", "key": pub_k, "aead-method": aead,
                     "padding-min": 2, "padding-max": 7, "table-type": table,
@@ -1497,27 +1493,21 @@ def build_inbound(kind: str, form: dict, env: dict) -> dict:
         cc = (form.get("tuic_cc") or "bbr").strip()
         if cc not in ("bbr", "cubic", "new_reno"):
             cc = "bbr"
-        udp_mode = (form.get("tuic_udp_mode") or "native").strip()
-        if udp_mode not in ("native", "quic"):
-            udp_mode = "native"
+        udp_mode = "native"
         listener = {**base, "type": "tuic", "users": {uid: pw},
                     "certificate": CERT, "private-key": KEY,
                     "congestion-controller": cc, "alpn": ["h3"]}
         client = {"name": f"{label}|Clash|TUICv5", "type": "tuic", "server": domain, "port": port,
                   "uuid": uid, "password": pw, "sni": domain, "alpn": ["h3"],
                   "congestion-controller": cc, "udp-relay-mode": udp_mode,
-                  "reduce-rtt": True, "skip-cert-verify": insecure, "udp": True}
+                  "reduce-rtt": True, "udp": True}
 
     else:  # shadowquic
         user = (form.get("sq_user") or "user").strip() or "user"
-        jls_addr = (form.get("sq_jls") or "www.microsoft.com:443").strip()
-        if ":" not in jls_addr:
-            jls_addr += ":443"
-        jls_host = jls_addr.rsplit(":", 1)[0]
-        cc = (form.get("sq_cc") or "bbr").strip()
-        if cc not in ("bbr", "cubic", "new_reno"):
-            cc = "bbr"
-        zero_rtt = form.get("sq_zero_rtt", "1") == "1"
+        jls_host = pick_reality_sni()
+        jls_addr = f"{jls_host}:443"
+        cc = "bbr"
+        zero_rtt = True
         pw = secrets.token_urlsafe(18)
         listener = {**base, "type": "shadowquic",
                     "users": [{"username": user, "password": pw}],
@@ -1531,6 +1521,130 @@ def build_inbound(kind: str, form: dict, env: dict) -> dict:
 
     return {"id": secrets.token_hex(6), "kind": kind, "port": port, "name": name,
             "created": int(time.time()), "listener": listener, "client": client}
+
+
+def can_reset_inbound_password(inb: dict) -> bool:
+    """Return True if the inbound has rotatable credentials; False for passwordless TLS listeners."""
+    kind = str(inb.get("kind", "")).lower()
+    lst = inb.get("listener") if isinstance(inb.get("listener"), dict) else {}
+    cli = inb.get("client") if isinstance(inb.get("client"), dict) else {}
+    if kind in ("vless-reality", "vless"):
+        return True
+    has_tls = bool(lst.get("certificate") or cli.get("tls"))
+    has_pw = bool(
+        cli.get("password") or cli.get("psk") or cli.get("key") or cli.get("uuid")
+        or lst.get("password") or lst.get("psk") or lst.get("key") or lst.get("token")
+        or lst.get("users")
+    )
+    if has_tls and not has_pw:
+        return False
+    return has_pw
+
+
+def rotate_inbound_credentials(inb: dict) -> dict:
+    """Rotate credentials in-place for an inbound dict (both server listener and client proxy)."""
+    updated = json.loads(json.dumps(inb))
+    kind = str(updated.get("kind", "")).lower()
+    lst = updated.setdefault("listener", {})
+    cli = updated.setdefault("client", {})
+
+    if kind == "vless-reality" or (kind == "vless" and isinstance(lst.get("reality-config"), dict)):
+        uid = str(uuidlib.uuid4())
+        priv, pub = reality_keypair()
+        sid = secrets.token_hex(4)
+        dec, enc = vless_x25519_keypair()
+        u_name = "user"
+        if isinstance(lst.get("users"), list) and lst["users"] and isinstance(lst["users"][0], dict):
+            u_name = str(lst["users"][0].get("username") or "user")
+        lst["users"] = [{"username": u_name, "uuid": uid, "flow": "xtls-rprx-vision"}]
+        lst["decryption"] = dec
+        rcfg = lst.setdefault("reality-config", {})
+        rcfg["private-key"] = priv
+        rcfg["short-id"] = [sid]
+        cli["uuid"] = uid
+        cli["encryption"] = enc
+        ropts = cli.setdefault("reality-opts", {})
+        ropts["public-key"] = pub
+        ropts["short-id"] = sid
+    elif kind == "vless":
+        uid = str(uuidlib.uuid4())
+        dec, enc = vless_x25519_keypair()
+        if isinstance(lst.get("users"), list) and lst["users"] and isinstance(lst["users"][0], dict):
+            lst["users"][0]["uuid"] = uid
+        else:
+            lst["users"] = [{"username": "user", "uuid": uid}]
+        lst["decryption"] = dec
+        cli["uuid"] = uid
+        cli["encryption"] = enc
+    elif kind == "shadowsocks":
+        pw = secrets.token_urlsafe(16)
+        lst["password"] = pw
+        cli["password"] = pw
+    elif kind == "hysteria2":
+        pw = secrets.token_urlsafe(18)
+        obfs_pw = secrets.token_urlsafe(16)
+        if isinstance(lst.get("users"), dict) and lst["users"]:
+            u_key = next(iter(lst["users"].keys()))
+            lst["users"] = {u_key: pw}
+        else:
+            lst["users"] = {"user": pw}
+        lst["obfs"] = "salamander"
+        lst["obfs-password"] = obfs_pw
+        cli["password"] = pw
+        cli["obfs"] = "salamander"
+        cli["obfs-password"] = obfs_pw
+    elif kind == "hysteria2-realm":
+        tok = secrets.token_hex(16)
+        lst["token"] = tok
+        cli["password"] = tok
+    elif kind == "snell":
+        psk = base64.b64encode(secrets.token_bytes(16)).decode()
+        lst["psk"] = psk
+        cli["psk"] = psk
+    elif kind == "anytls":
+        pw = secrets.token_urlsafe(18)
+        u_key = "user"
+        if isinstance(lst.get("users"), dict) and lst["users"]:
+            u_key = next(iter(lst["users"].keys()))
+        lst["users"] = {u_key: pw}
+        lst["padding-scheme"] = random_anytls_padding()
+        cli["password"] = pw
+    elif kind == "tuic":
+        uid = str(uuidlib.uuid4())
+        pw = secrets.token_urlsafe(18)
+        lst["users"] = {uid: pw}
+        cli["uuid"] = uid
+        cli["password"] = pw
+    elif kind == "sudoku":
+        priv_k, pub_k = sudoku_keypair()
+        lst["key"] = pub_k
+        cli["key"] = priv_k
+    elif kind == "vmess":
+        uid = str(uuidlib.uuid4())
+        if isinstance(lst.get("users"), list) and lst["users"] and isinstance(lst["users"][0], dict):
+            lst["users"][0]["uuid"] = uid
+        else:
+            lst["users"] = [{"username": "user", "uuid": uid, "alterId": 0}]
+        cli["uuid"] = uid
+    elif kind == "mieru":
+        pw = secrets.token_urlsafe(16)
+        u_key = str(cli.get("username") or "user")
+        if isinstance(lst.get("users"), dict) and lst["users"]:
+            u_key = next(iter(lst["users"].keys()))
+        lst["users"] = {u_key: pw}
+        cli["password"] = pw
+    else:  # trusttunnel, shadowquic, http, socks, mixed
+        pw = secrets.token_urlsafe(18)
+        u_name = str(cli.get("username") or "user")
+        if isinstance(lst.get("users"), dict) and lst["users"]:
+            u_key = next(iter(lst["users"].keys()))
+            lst["users"] = {u_key: pw}
+        else:
+            if isinstance(lst.get("users"), list) and lst["users"] and isinstance(lst["users"][0], dict):
+                u_name = str(lst["users"][0].get("username") or u_name)
+            lst["users"] = [{"username": u_name, "password": pw}]
+        cli["password"] = pw
+    return updated
 
 
 def render_nodes_tsv(nodes: list) -> str:
@@ -1997,7 +2111,7 @@ def apply_custom_config(raw_yaml: str):
     s = (raw_yaml or "").strip()
     if not s:
         raise ValueError("请输入完整的 mihomo 服务端配置内容")
-    s += "\n"
+    s = sanitize_doh_url_line(s) + "\n"
     was_custom = is_custom_config_mode()
     old_specs = collect_ufw_specs(read_nodes(), load_inbounds())
     files = (CUSTOM_CONF, CONF, NODES_TSV, INBOUNDS, PROXIES_JSON, PROVIDERS_JSON)
@@ -2043,9 +2157,11 @@ def apply_custom_config(raw_yaml: str):
 
 
 def reset_to_template_config():
-    """Exit custom config mode and re-assemble server config from standard template + fragments."""
+    """Restore server config to clean default template and generate a default VlessReality node."""
+    env = read_env()
     old_specs = collect_ufw_specs(read_nodes(), load_inbounds())
-    files = (CUSTOM_CONF, CONF, NODES_TSV, INBOUNDS, PROXIES_JSON, PROVIDERS_JSON)
+    files = (CUSTOM_CONF, CONF, NODES_TSV, INBOUNDS, PROXIES_JSON, PROVIDERS_JSON,
+             FRAG_REALITY, FRAG_EXTRA, FRAG_PROXIES, FRAG_PROVIDERS, FRAG_CONTROLLER)
     backup = {}
     for p in files:
         try:
@@ -2054,18 +2170,36 @@ def reset_to_template_config():
         except FileNotFoundError:
             backup[p] = None
     try:
+        reserved = {80, 443, int(env.get("PANEL_PORT", "0") or 0), get_controller_port(env)}
+        port = 28443
+        for _ in range(1000):
+            cand = random.randint(20000, 39999)
+            if cand not in reserved:
+                port = cand
+                break
+        priv, pub = reality_keypair()
+        dec, enc = vless_x25519_keypair()
+        default_node = {
+            "name": "VlessReality",
+            "port": port,
+            "uuid": str(uuidlib.uuid4()),
+            "priv": priv,
+            "pub": pub,
+            "sid": secrets.token_hex(4),
+            "sni": pick_reality_sni(),
+            "dec": dec,
+            "enc": enc,
+        }
         if os.path.exists(CUSTOM_CONF):
             os.remove(CUSTOM_CONF)
-        for p in (NODES_TSV, INBOUNDS, PROXIES_JSON, PROVIDERS_JSON):
-            bak_p = p + ".tplbak"
-            if os.path.isfile(bak_p):
-                with open(bak_p) as f:
-                    atomic_write(p, f.read(), 0o600 if p.endswith(".json") else 0o640)
-        atomic_write(FRAG_REALITY, render_reality(read_nodes()), 0o640)
-        atomic_write(FRAG_EXTRA, render_extra(load_inbounds()), 0o640)
-        atomic_write(FRAG_PROXIES, dump_yaml_proxies(load_server_proxies()), 0o640)
-        atomic_write(FRAG_PROVIDERS, dump_yaml_providers(load_proxy_providers()), 0o640)
-        env = read_env()
+        atomic_write(NODES_TSV, render_nodes_tsv([default_node]), 0o640)
+        atomic_write(INBOUNDS, "[]\n", 0o600)
+        atomic_write(PROXIES_JSON, "[]\n", 0o600)
+        atomic_write(PROVIDERS_JSON, "{}\n", 0o600)
+        atomic_write(FRAG_REALITY, render_reality([default_node]), 0o640)
+        atomic_write(FRAG_EXTRA, "", 0o640)
+        atomic_write(FRAG_PROXIES, "", 0o640)
+        atomic_write(FRAG_PROVIDERS, "", 0o640)
         atomic_write(FRAG_CONTROLLER, render_controller_fragment(env), 0o640)
         atomic_write(CONF, assemble_config(), 0o640)
         rc, out = validate_config()
@@ -2097,7 +2231,7 @@ def reality_client(n: dict, env: dict) -> dict:
     d = {
         "name": f"{n['name']}|Clash|Reality", "type": "vless",
         "server": env.get("SERVER_IP", ""), "port": n["port"], "uuid": n["uuid"], "tls": True,
-        "flow": "xtls-rprx-vision", "client-fingerprint": "safari", "skip-cert-verify": False,
+        "flow": "xtls-rprx-vision", "client-fingerprint": "safari",
     }
     if n.get("enc"):
         d["encryption"] = n["enc"]
@@ -2108,9 +2242,15 @@ def reality_client(n: dict, env: dict) -> dict:
     return d
 
 
+def sanitize_doh_url_line(line: str) -> str:
+    """Strip invalid `#group-name&ecs=...` fragments from DoH URLs in DNS nameserver blocks."""
+    return re.sub(r'(https?://[^\s"\'#]+/dns-query)#[^\s"\']*', r'\1', line)
+
+
 def render_subscription(env: dict) -> str:
     """Full mihomo client config: install Reality nodes + panel/custom inbounds, via client.yaml.tpl."""
-    proxies = [reality_client(n, env) for n in read_nodes()] + [i["client"] for i in load_inbounds()]
+    raw_proxies = [reality_client(n, env) for n in read_nodes()] + [i["client"] for i in load_inbounds()]
+    proxies = [{k: v for k, v in p.items() if k != "skip-cert-verify"} for p in raw_proxies]
     p_lines = "\n".join("  - " + json.dumps(p, ensure_ascii=False) for p in proxies) if proxies else "  []"
     n_lines = "\n".join("      - " + json.dumps(p["name"], ensure_ascii=False) for p in proxies) if proxies else '      - "DIRECT"'
     out = []
@@ -2123,7 +2263,7 @@ def render_subscription(env: dict) -> str:
             elif key == "@@PROXY_NAMES@@":
                 out.append(n_lines + "\n")
             else:
-                out.append(line)
+                out.append(sanitize_doh_url_line(line))
     return "".join(out)
 
 
@@ -2198,7 +2338,7 @@ def render_spa_html(title: str, boot_data: dict, fallback_html: str = "") -> str
         f"<style>{css}</style>"
         f"<script>window.__CS_BOOT__ = {boot_json};</script>"
         "</head>"
-        "<body class='bg-slate-50 text-slate-900 antialiased'>"
+        "<body class='bg-[#f6faf8] text-slate-900 antialiased'>"
         f"<div id=app>{fallback_html}</div>"
         f"<script type=module>{js}</script>"
         "</body></html>"
@@ -2307,6 +2447,8 @@ class Panel(BaseHTTPRequestHandler):
                 "kind_label": KIND_ZH["vless-reality"],
                 "port": n["port"],
                 "listening": n["port"] in listening,
+                "can_reset_password": True,
+                "reset_url": f"/nodes/{quote(n['name'])}/reset-password",
                 "delete_url": f"/nodes/{quote(n['name'])}/delete",
                 "single_config": "- " + json.dumps(proxy, ensure_ascii=False),
                 "readable_config": "\n".join(dump_yaml_map(proxy, indent=2, first_dash=True)),
@@ -2314,6 +2456,7 @@ class Panel(BaseHTTPRequestHandler):
         for i in inbs:
             proxy = i["client"]
             all_proxies.append(proxy)
+            can_reset = can_reset_inbound_password(i)
             inbound_items.append({
                 "key": f"inb:{i['id']}",
                 "name": i["name"],
@@ -2321,6 +2464,8 @@ class Panel(BaseHTTPRequestHandler):
                 "kind_label": KIND_ZH.get(i["kind"], i["kind"]),
                 "port": i["port"],
                 "listening": i["port"] in listening,
+                "can_reset_password": can_reset,
+                "reset_url": f"/inbounds/{i['id']}/reset-password" if can_reset else "",
                 "delete_url": f"/inbounds/{i['id']}/delete",
                 "single_config": "- " + json.dumps(proxy, ensure_ascii=False),
                 "readable_config": "\n".join(dump_yaml_map(proxy, indent=2, first_dash=True)),
@@ -2375,6 +2520,7 @@ class Panel(BaseHTTPRequestHandler):
             "csrf": s["csrf"],
             "sub_url": self.sub_url(),
             "zb_url": zashboard_url(env),
+            "mihomo_secret": get_mihomo_secret(env),
             "srv_cfg_url": "/config/server.yaml",
             "controller_port": cport,
             "controller_listening": cport in listening,
@@ -2420,7 +2566,7 @@ class Panel(BaseHTTPRequestHandler):
                 f"<div class='max-w-md w-full bg-white rounded-2xl border p-8 shadow-sm'>"
                 f"<h1 class='text-lg font-bold'>{e(title)}</h1>"
                 f"<p class='text-sm text-slate-600 mt-2 mb-4'>{e(text)}</p>"
-                f"<a class='inline-block px-4 py-2 rounded-lg bg-indigo-600 text-white text-sm' href=/>返回控制台</a>"
+                f"<a class='inline-block px-4 py-2 rounded-lg bg-emerald-600 text-white text-sm' href=/>返回控制台</a>"
                 f"</div></div>")
         self.send(code, render_spa_html(title, {"page": "error", "version": VERSION}, body))
 
@@ -2475,7 +2621,13 @@ class Panel(BaseHTTPRequestHandler):
         if not s:
             return self.redirect("/login")
         if path == "/":
-            return self.send(200, self.dashboard(s))
+            return self.send(200, self.dashboard(s, initial_tab="inbounds"))
+        if path in ("/outbounds",):
+            return self.send(200, self.dashboard(s, initial_tab="outbounds"))
+        if path in ("/readable", "/convert"):
+            return self.send(200, self.dashboard(s, initial_tab="readable"))
+        if path in ("/advanced", "/custom-config"):
+            return self.send(200, self.dashboard(s, initial_tab="advanced"))
         if path == "/api/state":
             return self.send(200, json.dumps(self.build_client_state(s), ensure_ascii=False), "application/json; charset=utf-8")
         if path in ("/config/server.yaml", "/server.yaml"):
@@ -2537,13 +2689,32 @@ class Panel(BaseHTTPRequestHandler):
             return self.do_save_custom_config(s, form)
         if path == "/config/reset-template":
             return self.do_reset_template_config(s)
+        if path == "/api/convert-readable":
+            return self.do_convert_readable(form)
         m = re.fullmatch(r"/inbounds/([0-9a-f]{12})/delete", path)
         if m:
             return self.do_delete(s, m.group(1))
+        m = re.fullmatch(r"/inbounds/([0-9a-f]{12})/reset-password", path)
+        if m:
+            return self.do_reset_inbound_password(s, m.group(1))
         m = re.fullmatch(r"/nodes/([A-Za-z0-9._-]{1,48})/delete", path)
         if m:
             return self.do_delete_node(s, m.group(1))
+        m = re.fullmatch(r"/nodes/([A-Za-z0-9._-]{1,48})/reset-password", path)
+        if m:
+            return self.do_reset_node_password(s, m.group(1))
         self.simple(404, "页面不存在", "请检查地址是否正确。")
+
+    def do_convert_readable(self, form):
+        raw = form.get("raw", "")
+        try:
+            items = parse_mihomo_proxies(raw)
+            readable = "proxies:\n" + dump_yaml_proxies(items)
+            single = "proxies:\n" + "\n".join("  - " + json.dumps(p, ensure_ascii=False) for p in items)
+            payload = {"ok": True, "count": len(items), "readable": readable.rstrip("\n"), "single": single}
+            return self.send(200, json.dumps(payload, ensure_ascii=False), "application/json; charset=utf-8")
+        except Exception as e:
+            return self.send(400, json.dumps({"ok": False, "msg": str(e)}, ensure_ascii=False), "application/json; charset=utf-8")
 
     def do_server_config(self):
         """GET /config/server.yaml - session-authenticated view of current running server config."""
@@ -2705,6 +2876,56 @@ class Panel(BaseHTTPRequestHandler):
                 return self.respond_mutation(s, f"删除失败：{e}", False)
         return self.respond_mutation(s, f"已删除入站「{name}」", True)
 
+    def do_reset_node_password(self, s, name):
+        with LOCK:
+            cur = read_nodes()
+            found = False
+            new_nodes = []
+            try:
+                for n in cur:
+                    if n["name"] == name:
+                        found = True
+                        priv, pub = reality_keypair()
+                        dec, enc = vless_x25519_keypair()
+                        n = dict(n)
+                        n["uuid"] = str(uuidlib.uuid4())
+                        n["priv"] = priv
+                        n["pub"] = pub
+                        n["sid"] = secrets.token_hex(4)
+                        n["dec"] = dec
+                        n["enc"] = enc
+                    new_nodes.append(n)
+                if not found:
+                    return self.respond_mutation(s, "入站节点不存在", False)
+                apply_nodes(new_nodes)
+            except Exception as e:
+                return self.respond_mutation(s, f"重置密钥失败：{e}", False)
+        return self.respond_mutation(s, f"已重置节点「{name}」的 UUID、Reality 私钥与 VLESS 加密密钥，服务端与订阅已同步更新。", True)
+
+    def do_reset_inbound_password(self, s, iid):
+        with LOCK:
+            cur = load_inbounds()
+            target_name = ""
+            target_kind = ""
+            new_inbs = []
+            try:
+                for i in cur:
+                    if i["id"] == iid:
+                        if not can_reset_inbound_password(i):
+                            return self.respond_mutation(s, "该入站协议无需密码，不支持重置密码", False)
+                        target_name = i["name"]
+                        target_kind = i["kind"]
+                        i = rotate_inbound_credentials(i)
+                    new_inbs.append(i)
+                if not target_name:
+                    return self.respond_mutation(s, "入站节点不存在", False)
+                apply_inbounds(new_inbs)
+            except Exception as e:
+                return self.respond_mutation(s, f"重置密码失败：{e}", False)
+        if target_kind in ("vless-reality", "vless"):
+            return self.respond_mutation(s, f"已重置节点「{target_name}」的 UUID、Reality 私钥与 VLESS 加密密钥，服务端与订阅已同步更新。", True)
+        return self.respond_mutation(s, f"已重置节点「{target_name}」的随机密码/密钥，服务端与客户端订阅已同步更新。", True)
+
     def do_add_proxies(self, s, form):
         raw = form.get("proxies_raw", "")
         with LOCK:
@@ -2782,8 +3003,8 @@ class Panel(BaseHTTPRequestHandler):
             try:
                 reset_to_template_config()
             except Exception as e:
-                return self.respond_mutation(s, f"恢复默认模板失败：{e}", False)
-        return self.respond_mutation(s, "已退出自定义配置模式，恢复为内置服务端模板并重启生效。", True)
+                return self.respond_mutation(s, f"恢复默认配置失败：{e}", False)
+        return self.respond_mutation(s, "已恢复默认服务端配置，并生成默认 VlessReality 节点。", True)
 
     # -- views
     def login_page(self, err=""):
@@ -2799,14 +3020,18 @@ class Panel(BaseHTTPRequestHandler):
         )
         return render_spa_html("登录 · Clash Serve", boot, fallback)
 
-    def dashboard(self, s):
+    def dashboard(self, s, initial_tab="inbounds"):
         q = parse_qs(urlparse(self.path).query)
         msg, ok = q.get("msg", [""])[0], q.get("ok", ["1"])[0] == "1"
+        tab_q = q.get("tab", [""])[0]
+        if tab_q in ("inbounds", "outbounds", "readable", "advanced"):
+            initial_tab = tab_q
         env = read_env()
         st = mihomo_status()
         state = self.build_client_state(s, env, st)
         boot = {
             "page": "dashboard",
+            "initial_tab": initial_tab,
             "flash_msg": msg,
             "flash_ok": ok,
             **state,
@@ -2817,8 +3042,18 @@ class Panel(BaseHTTPRequestHandler):
         inb_rows = "".join(
             f"<div><span>{e(it['name'])}</span><span>{e(it['kind_label'])}</span>"
             f"<span>:{it['port']}</span>"
-            f"<button type=button>复制配置</button><button type=button>复制易读配置</button></div>"
+            f"<button type=button>复制配置</button>"
+            + (f"<form method=post action='{e(it['reset_url'])}'>{hid}<button type=submit>重置密码</button></form>" if it.get("can_reset_password") else "")
+            + "</div>"
             for it in state["inbounds"]
+        )
+        zb_sec = (
+            f"<section id=zashboard-card><h2>Zashboard 控制面板</h2>"
+            f"<div id=zb-url>{e(state['zb_url'])}</div>"
+            f"<div id=zb-secret>{e(state.get('mihomo_secret', ''))}</div>"
+            f"<a href='{e(state['zb_url'] or '#')}' target=_blank rel=noopener>打开 Zashboard</a>"
+            f"<button type=button>复制地址</button>"
+            f"<form method=post action=/action/reset-secret>{hid}<button type=submit>重置 API 密钥</button></form></section>"
         )
         sub_sec = (
             f"<section><h2>客户端订阅链接</h2><div id=sub-url>{e(state['sub_url'])}</div>"
@@ -2828,10 +3063,11 @@ class Panel(BaseHTTPRequestHandler):
         )
         fallback = (
             f"<header><span>Clash Serve</span><span>v{VERSION}</span></header>"
-            f"<main>{sub_sec}"
+            f"<main>{zb_sec}{sub_sec}"
             f"<section><h2>入站节点</h2>{inb_rows}</section>"
             f"<section><h2>添加监听器</h2><form method=post action=/inbounds/add>{hid}"
             f"<select id=kind name=kind>{opts}</select>"
+            f"<p>{e(PROTOCOL_DESCRIPTIONS['vless-reality'])}</p>"
             f"<input id=nm name=name value=VlessReality placeholder='默认 VlessReality'>"
             f"<input id=port name=port placeholder='留空随机端口'>"
             f"<button type=submit>添加入站节点</button></form></section></main>"
