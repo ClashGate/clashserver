@@ -109,6 +109,14 @@ esac
 exec 9>"$LOCK_FILE"
 flock -w 600 9 || { err "另一个证书任务仍在运行"; exit 1; }
 
+if [[ $CERT_MODE == manual ]]; then
+  valid_pair "$DEST/fullchain.pem" "$DEST/privkey.pem" || exit 1
+  chown root:mihomo "$DEST/fullchain.pem" "$DEST/privkey.pem" 2>/dev/null || true
+  chmod 640 "$DEST/fullchain.pem" "$DEST/privkey.pem"
+  say "手动证书校验正常：$DEST（到期：$(openssl x509 -noout -enddate -in "$DEST/fullchain.pem" | cut -d= -f2)）"
+  exit 0
+fi
+
 if [[ $TLS == internal ]]; then   # 开发用：本机自签，不走 ACME
   d=$ACME_HOME/internal
   if [[ ! -f $d/$BASE_DOMAIN.crt ]] || ! openssl x509 -checkend $((30 * 86400)) -noout -in "$d/$BASE_DOMAIN.crt" >/dev/null 2>&1; then

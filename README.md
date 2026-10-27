@@ -18,10 +18,11 @@
 ## ✨ 特性
 
 - **傻瓜式一键**：一条 `curl | bash` 命令，中文交互，直接回车即可完成安装；默认值覆盖常见场景，无需记参数。
-- **两种模式**：
-  - **无证书模式**（默认）：VLESS Reality 节点，不需要域名，安装后直接输出客户端配置。
+- **三种模式**：
+  - **无证书模式**（默认）：VLESS Reality 节点（默认入站名 `VlessReality`），不需要域名，安装后直接输出带基本分流规则的客户端配置。
   - **自动证书模式**：自动申请并续期 Let's Encrypt 证书（支持**端口模式**与 **DNS API 模式**），Mihomo 节点与 HTTPS 管理面板共用同一张证书，提供订阅链接，无需额外的 Web 服务器。
-- **管理面板**：中文 Web 面板，查看 Mihomo 状态、一键重启 / 重载、立即申请 / 续期证书，添加或删除 VLESS Reality / Shadowsocks (SS) / Hysteria2 / Snell / TrustTunnel 入站，内置 Mihomo 控制面板（Zashboard）HTTPS 入口与密钥卡片，支持复制订阅链接或全部节点配置。
+  - **手动证书模式**：使用用户自备的域名证书（放入 `/etc/mihomo/certs/` 目录并自动校验有效性），提供 HTTPS 管理面板和订阅链接。
+- **管理面板（v0.4）**：中文 Web 面板，查看 Mihomo 状态、一键重启 / 重载，支持在「mihomo 服务端配置」卡片中查看当前运行中的服务端配置（需登录鉴权）、手工粘贴单行 JSON 或多行 YAML 节点追加到服务端 `proxies:`、一键直连 Zashboard 控制面板，局部无刷新添加或删除 VLESS Reality / Shadowsocks (`aes-128-gcm` / `aes-256-gcm`) / Hysteria2 / Snell / TrustTunnel 入站（默认开启 `udp: true`），支持复制订阅链接或全部节点配置。
 - **订阅链接**：`https://域名:端口/sub/<随机串>/mihomo.yaml`，带随机凭证，可随时更换。
 - **`clashserver` 命令**：安装后直接输入 `clashserver` 打开中文管理菜单；常用操作都有短子命令。
 - **安全默认**：端口、UUID、密钥、密码全部随机生成；面板自身提供 HTTPS（不经反代），登录失败次数限制；改配置前先 `mihomo -t` 校验，失败自动回滚。
@@ -36,10 +37,11 @@ curl -fsSL https://raw.githubusercontent.com/saulsburyroy/clashserver/main/insta
 
 按提示选择模式，**直接回车即为无证书模式**。
 
-已有域名，想要管理面板和订阅链接：选择 **2) 自动证书模式**，按提示选择证书申请方式：
+已有域名，想要管理面板和订阅链接：可选择 **2) 自动证书模式** 或 **3) 手动证书模式**：
 
-- **端口模式**（默认）：申请 / 续期证书时临时占用 **80** 端口；需将域名 A 记录指向本机并放行 TCP 80（Cloudflare 请设为 **灰云 DNS only**）。
-- **DNS API 模式**：填写 Cloudflare API Token 自动完成域名验证，**无需开放 80 / 443 端口**，支持 `*.example.com` 泛域名。
+- **端口模式**（自动证书默认）：申请 / 续期证书时临时占用 **80** 端口；需将域名 A 记录指向本机并放行 TCP 80（Cloudflare 请设为 **灰云 DNS only**）。
+- **DNS API 模式**（自动证书）：填写 Cloudflare API Token 自动完成域名验证，**无需开放 80 / 443 端口**，支持 `*.example.com` 泛域名。
+- **手动证书模式**：按提示将自备证书（`fullchain.pem` 与 `privkey.pem`）放入 `/etc/mihomo/certs/` 目录，检测证书有效性通过后自动完成部署。
 - 环境：Debian 12（推荐）、systemd、root，服务器可直连 GitHub。管理面板在安装时自动选取**随机空闲高端口**提供 HTTPS（无需占用 443，安装输出与面板中均会明确展示端口）。
 
 ## 🚀 快速上手
@@ -80,7 +82,6 @@ clashserver
   sub                查看订阅链接（自动证书模式）
   reset-sub          更换订阅链接，旧链接立即失效
   passwd             修改面板密码（自定义）
-  reset-password     重置面板密码（随机）
   reset-secret       重置 Zashboard API 密钥（随机）
   cert               立即申请 / 续期证书（平时自动续期）
   restart            重启 Mihomo
@@ -103,12 +104,7 @@ clashserver
 ## 🔄 更新
 
 ```bash
-# 同时更新 Mihomo 内核与 clashserver（脚本、面板、模板）
 clashserver update
-
-# 只更新其一
-clashserver update core
-clashserver update self
 ```
 
 更新不会改变节点、密钥、面板密码和订阅链接。
@@ -175,8 +171,7 @@ scripts/
 
 1. ✅ 无证书模式：VLESS Reality 一键安装
 2. 🚧 自动证书模式：Let's Encrypt 证书 + HTTPS 面板 + 订阅链接
-3. ⏳ 自定义反代模式
-4. ⏳ 流量统计、权限、Docker 等
+3. ⏳ 流量统计、权限、Docker 等
 
 ## ⚠️ 特别声明
 

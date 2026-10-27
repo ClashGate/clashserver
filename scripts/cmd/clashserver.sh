@@ -14,18 +14,18 @@ if [[ -n ${CS_BOOTSTRAP_TMP:-} ]]; then trap 'rm -rf "$CS_BOOTSTRAP_TMP"' EXIT; 
 
 usage() {
   cat <<'EOF'
-clashserver —— Mihomo 代理服务端管理命令
+clashserver —— Mihomo 代理服务端管理命令 (v0.4)
 
 用法：clashserver [子命令]
   （不带参数）       打开中文交互菜单
   status            查看运行状态（服务、端口、证书）
   info              查看节点配置（proxies 片段、客户端配置目录、订阅链接）
-  sub               查看订阅链接（自动证书模式）
+  sub               查看订阅链接（证书模式）
   reset-sub         更换订阅链接，旧链接立即失效
   passwd            修改面板密码（自定义）
   reset-password    重置面板密码（随机生成）
   reset-secret      重置 Zashboard API 密钥（随机生成）
-  cert              立即申请 / 续期证书（自动证书模式，平时自动续期）
+  cert              立即申请 / 续期 / 校验证书
   restart           重启 Mihomo
   update            更新 Mihomo 内核 + clashserver 自身（update core / update self 只更新其一）
   log               查看最近日志
@@ -39,29 +39,47 @@ EOF
 
 interactive_setup() {
   has_tty || return 0
-  local menu=0 c p
+  local menu=0 c
   if ((!MODE_SET)); then
     menu=1
-    printf '\n\033[1mclashserver 一键安装\033[0m\n\n'
+    printf '\n\033[1mclashserver v%s 一键安装\033[0m\n\n' "$CS_VERSION"
     printf '请选择安装模式：\n'
     printf '  1) 无证书模式（默认）：仅 VLESS Reality 节点，安装后输出客户端配置\n'
-    printf '  2) 自动证书模式：申请域名证书，提供 HTTPS 管理面板和订阅链接\n'
+    printf '  2) 自动证书模式：自动申请域名证书（端口模式 / DNS API），提供 HTTPS 管理面板和订阅链接\n'
+    printf '  3) 手动证书模式：使用自备域名证书，校验通过后提供 HTTPS 管理面板和订阅链接\n'
     while :; do
-      c=$(ask '请输入 [1/2]（回车默认 1）：' 1)
-      case $c in 1) MODE=no-cert; break ;; 2) MODE=auto-cert; break ;; *) printf '请输入 1 或 2\n' ;; esac
+      c=$(ask '请输入 [1/2/3]（回车默认 1）：' 1)
+      case $c in
+        1) MODE=no-cert; break ;;
+        2) MODE=auto-cert; break ;;
+        3) MODE=auto-cert; CERT_MODE=manual; CERT_MODE_SET=1; break ;;
+        *) printf '请输入 1、2 或 3\n' ;;
+      esac
     done
   fi
   [[ $MODE == auto-cert ]] || return 0
   if ((!CERT_MODE_SET)) && ((menu)); then
-    printf '\n请选择证书申请方式：\n'
+    printf '\n请选择证书方式：\n'
     printf '  1) 端口模式（默认）：申请/续期时临时占用 80 端口（需将域名解析到本机并放行 TCP 80）\n'
     printf '  2) DNS API 模式：使用 Cloudflare API Token 验证（无需占用 80/443 端口，支持 *.泛域名）\n'
+    printf '  3) 手动证书模式：自行将证书文件放入 %s/certs/ 目录\n' "$CONF_DIR"
     while :; do
-      c=$(ask '请输入 [1/2]（回车默认 1）：' 1)
-      case $c in 1) CERT_MODE=port; break ;; 2) CERT_MODE=dns; break ;; *) printf '请输入 1 或 2\n' ;; esac
+      c=$(ask '请输入 [1/2/3]（回车默认 1）：' 1)
+      case $c in
+        1) CERT_MODE=port; break ;;
+        2) CERT_MODE=dns; break ;;
+        3) CERT_MODE=manual; break ;;
+        *) printf '请输入 1、2 或 3\n' ;;
+      esac
     done
   fi
-  if [[ $CERT_MODE == dns ]]; then
+  if [[ $CERT_MODE == manual ]]; then
+    while [[ -z $DOMAIN || ! ${DOMAIN,,} =~ $WILDCARD_DOMAIN_RE ]]; do
+      [[ -n $DOMAIN ]] && printf '域名格式不正确：%s\n' "$DOMAIN"
+      DOMAIN=$(ask '请输入证书对应的域名（如 example.com）：' '')
+    done
+    printf '手动证书目录路径：\033[1;36m%s/certs/\033[0m（安装过程中将提示放入 fullchain.pem 与 privkey.pem 并检测有效性）\n' "$CONF_DIR"
+  elif [[ $CERT_MODE == dns ]]; then
     while [[ -z $DOMAIN || ! ${DOMAIN,,} =~ $WILDCARD_DOMAIN_RE ]]; do
       [[ -n $DOMAIN ]] && printf '域名格式不正确：%s\n' "$DOMAIN"
       DOMAIN=$(ask '请输入域名（如 example.com 或 *.example.com）：' '')
@@ -73,7 +91,7 @@ interactive_setup() {
   else
     while [[ -z $DOMAIN || ! ${DOMAIN,,} =~ $DOMAIN_RE ]]; do
       if [[ $DOMAIN == \*.* ]]; then
-        printf '通配符域名仅支持「DNS API 模式」，请输入具体域名\n'
+        printf '通配符域名仅支持「DNS API 模式」或「手动证书模式」，请输入具体域名\n'
       elif [[ -n $DOMAIN ]]; then
         printf '域名格式不正确：%s\n' "$DOMAIN"
       fi
@@ -83,7 +101,7 @@ interactive_setup() {
   ((menu)) || return 0   # 开发用隐藏参数 -d 启动时不再追问
   [[ -n $PANEL_PORT ]] || PANEL_PORT=$(rand_port)
   printf '已分配管理面板随机空闲高端口：%s\n' "$PANEL_PORT"
-  if [[ -z $EMAIL ]]; then EMAIL=$(ask '证书通知邮箱（可选，回车跳过）：' ''); fi
+  # 证书通知邮箱默认直接跳过，不再询问
   return 0
 }
 
@@ -120,11 +138,11 @@ verify() {
   panel_https_ok "/sub/$SUB_TOKEN/mihomo.yaml" | grep -q '^proxies:' || die "订阅接口没有返回 mihomo 配置"
   [[ $(curl -sk -o /dev/null -w '%{http_code}' --resolve "$h:$p:127.0.0.1" \
     "$(panel_url)/sub/wrongtoken0000000000000000/mihomo.yaml") == 404 ]] || die "订阅接口未拒绝错误的 token"
-  info "订阅链接：需要 token（错误 token 返回 404）正常"
+  info "订阅链接：$(sub_url) 正常"
 }
 
 print_summary() {
-  printf '\n\033[1;32m✔ 安装完成！\033[0m\n\n'
+  printf '\n\033[1;32m✔ 安装完成！（Clash Serve v%s）\033[0m\n\n' "$CS_VERSION"
   printf '请在云服务商的防火墙 / 安全组放行以下 TCP 端口：'
   if [[ $MODE == auto-cert ]]; then
     [[ ${CERT_MODE:-port} == port ]] && printf ' 80'
@@ -135,15 +153,19 @@ print_summary() {
   if [[ $MODE == auto-cert ]]; then
     printf '\n\033[1mmihomo 订阅链接\033[0m（导入 mihomo / Clash 客户端即可；链接即凭证，泄露后执行 clashserver reset-sub 更换）：\n'
     printf '  \033[1;36m%s\033[0m\n' "$(sub_url)"
-    [[ $TLS == production ]] || printf '  注意：当前为%s，客户端可能拒绝下载订阅\n' "$(tls_label)"
+    if [[ ${CERT_MODE:-port} != manual && $TLS != production ]]; then
+      printf '  注意：当前为%s，客户端可能拒绝下载订阅\n' "$(tls_label)"
+    fi
     printf '\n\033[1m管理面板\033[0m\n'
     printf '  地址：%s\n  端口：%s（随机空闲高端口，请确保防火墙已放行 TCP %s）\n  用户名：admin\n' "$(panel_url)" "$(panel_port)" "$(panel_port)"
     [[ -n $PANEL_PASS ]] && printf '  密码：%s（仅显示一次；可用 clashserver passwd 修改）\n' "$PANEL_PASS"
-    printf '  申请方式：%s\n' "$(cert_mode_label)"
+    printf '  证书方式：%s\n' "$(cert_mode_label)"
     printf '  证书：%s\n' "$(tls_label)"
-    printf '\n\033[1mMihomo 控制面板（Zashboard）\033[0m\n'
+    printf '\n\033[1mmihomo 服务端配置（Zashboard）\033[0m\n'
     printf '  地址：%s\n  API 密钥（Secret）：%s\n' "$(zashboard_url)" "$MIHOMO_SECRET"
-    if cert_is_temp; then printf '  \033[1;33m证书尚未签发成功，当前为临时自签证书；检查配置后可执行 clashserver cert 立即重试\033[0m\n'; fi
+    if [[ ${CERT_MODE:-port} != manual ]] && cert_is_temp; then
+      printf '  \033[1;33m证书尚未签发成功，当前为临时自签证书；检查配置后可执行 clashserver cert 立即重试\033[0m\n'
+    fi
     printf '\n本地客户端配置备份：%s\n' "$CLIENT_DIR"
   else
     printf '\n\033[1m客户端 proxies 片段\033[0m\n'
@@ -168,7 +190,9 @@ do_install() {
   fi
   interactive_setup
   check_existing
-  [[ $MODE == auto-cert ]] && TOTAL=11
+  if [[ $MODE == auto-cert ]]; then
+    TOTAL=$([[ ${CERT_MODE:-port} == manual ]] && echo 10 || echo 11)
+  fi
   [[ -n $VPS_NAME ]] || VPS_NAME=$(hostname)
   install_deps
   [[ $MODE == auto-cert ]] && preflight_cert
@@ -178,7 +202,11 @@ do_install() {
   save_env
   install_core; ensure_user; log "安装 clashserver 文件"; install_files; gen_nodes
   if [[ $MODE == auto-cert ]]; then
-    install_acme; issue_cert
+    if [[ ${CERT_MODE:-port} == manual ]]; then
+      setup_manual_cert
+    else
+      install_acme; issue_cert
+    fi
   fi
   render_server; render_client; setup_service
   if [[ $MODE == auto-cert ]]; then
@@ -215,11 +243,14 @@ update_self() {
   rm -rf "$tmp"
   install -m 644 "$LIB_DIR/scripts/init/mihomo.service" "$UNIT"
   if [[ $MODE == auto-cert ]]; then
-    install -m 644 "$LIB_DIR/scripts/init/clashserve.service" "$LIB_DIR/scripts/init/clashserver-cert.service" \
-      "$LIB_DIR/scripts/init/clashserver-cert.timer" /etc/systemd/system/
+    install -m 644 "$LIB_DIR/scripts/init/clashserve.service" /etc/systemd/system/
+    if [[ ${CERT_MODE:-port} != manual ]]; then
+      install -m 644 "$LIB_DIR/scripts/init/clashserver-cert.service" \
+        "$LIB_DIR/scripts/init/clashserver-cert.timer" /etc/systemd/system/
+    fi
   fi
   systemctl daemon-reload
-  if [[ $MODE == auto-cert ]]; then
+  if [[ $MODE == auto-cert && ${CERT_MODE:-port} != manual ]]; then
     migrate_lego
     systemctl enable clashserver-cert.timer >/dev/null 2>&1 || true
     systemctl restart clashserver-cert.timer || true   # 让新的触发规则立即生效
@@ -233,8 +264,15 @@ update_self() {
   info "clashserver 已更新到 GitHub main 最新版"
 }
 
-do_cert() { # 立即申请 / 续期证书
+do_cert() { # 立即申请 / 续期 / 校验证书
   require_installed; load_env; require_panel
+  if [[ ${CERT_MODE:-port} == manual ]]; then
+    printf '正在校验手动证书（%s/certs/）……\n' "$CONF_DIR"
+    check_manual_cert_files || return 1
+    systemctl restart mihomo || true
+    printf '手动证书正常：%s，到期 %s（剩余 %s 天）\n' "$(cert_issuer)" "$(cert_enddate)" "$(cert_days_left)"
+    return 0
+  fi
   printf '正在申请 / 续期证书（%s，%s，%s）……\n' "$DOMAIN" "$(cert_mode_label)" "$(tls_label)"
   if ! "$LIB_DIR/scripts/certctl.sh" renew; then
     if [[ ${CERT_MODE:-port} == dns ]]; then
@@ -250,11 +288,15 @@ do_cert() { # 立即申请 / 续期证书
 
 do_status() {
   require_installed; load_env
-  printf '\033[1m运行状态\033[0m\n'
-  printf '  安装模式：%s\n' "$([[ $MODE == auto-cert ]] && echo "自动证书模式（$(cert_mode_label)）" || echo '无证书模式')"
+  printf '\033[1m运行状态（Clash Serve v%s）\033[0m\n' "$CS_VERSION"
+  printf '  安装模式：%s\n' "$(mode_label)"
   printf '  Mihomo：%s  %s\n' "$(svc_state mihomo)" "$("$BIN" -v 2>/dev/null | head -n1 | awk '{print $3}')"
   if [[ $MODE == auto-cert ]]; then
-    printf '  面板：%s（%s，端口 %s）    证书自动续期：%s\n' "$(svc_state clashserve)" "$(panel_url)" "$(panel_port)" "$(svc_state clashserver-cert.timer)"
+    if [[ ${CERT_MODE:-port} == manual ]]; then
+      printf '  面板：%s（%s，端口 %s）\n' "$(svc_state clashserve)" "$(panel_url)" "$(panel_port)"
+    else
+      printf '  面板：%s（%s，端口 %s）    证书自动续期：%s\n' "$(svc_state clashserve)" "$(panel_url)" "$(panel_port)" "$(svc_state clashserver-cert.timer)"
+    fi
     printf '  Zashboard：%s（端口 %s，API 密钥：%s）\n' "$(zashboard_url)" "${CONTROLLER_PORT:-7896}" "${MIHOMO_SECRET:-—}"
     printf '  域名：%s（证书：%s）\n' "$DOMAIN" "$(tls_label)"
     if cert_is_temp; then
@@ -263,12 +305,14 @@ do_status() {
       local days; days=$(cert_days_left)
       printf '  证书到期：%s（%s，剩余 %s 天）\n' "$(cert_enddate)" "$(cert_issuer)" "$days"
       if [[ -n $days ]] && ((days < 14)); then
-        printf '  \033[1;33m证书即将到期且尚未续期成功\033[0m：请执行 clashserver cert 查看原因\n'
+        printf '  \033[1;33m证书即将到期\033[0m：请及时续期或更新证书（clashserver cert）\n'
       fi
     else
       printf '  证书：\033[1;31m缺失\033[0m（执行 clashserver cert）\n'
     fi
-    printf '  上次自动续期：%s\n' "$(cert_last_run)"
+    if [[ ${CERT_MODE:-port} != manual ]]; then
+      printf '  上次自动续期：%s\n' "$(cert_last_run)"
+    fi
   fi
   printf '  节点端口：\n'
   local name port rest
@@ -313,7 +357,7 @@ do_sub() {
 
 do_reset_sub() {
   load_env
-  [[ $MODE == auto-cert && -f $PANEL_CFG ]] || die "订阅链接仅在自动证书模式下提供"
+  [[ $MODE == auto-cert && -f $PANEL_CFG ]] || die "订阅链接仅在自动证书或手动证书模式下提供"
   PANEL_HASH=$(panel_cfg_get password_hash)
   SUB_TOKEN=$(new_sub_token)
   write_panel_cfg
@@ -341,7 +385,7 @@ do_passwd() {
 
 do_reset_password() {
   load_env
-  [[ $MODE == auto-cert && -f $PANEL_CFG ]] || die "未安装管理面板（仅自动证书模式提供）"
+  [[ $MODE == auto-cert && -f $PANEL_CFG ]] || die "未安装管理面板（仅证书模式提供）"
   set_panel_password
   systemctl restart clashserve
   printf '管理面板：%s\n用户名：admin\n新密码：%s\n' "$(panel_url)" "$PANEL_PASS"
@@ -381,11 +425,11 @@ do_menu() {
   items+=(status info);          labels+=("查看运行状态" "查看节点配置")
   if [[ $MODE == auto-cert ]]; then
     items+=(sub reset-sub passwd reset-password reset-secret cert)
-    labels+=("查看订阅链接" "更换订阅链接" "修改面板密码（自定义）" "重置面板密码（随机）" "重置 Zashboard 密钥（随机）" "立即申请 / 续期证书")
+    labels+=("查看订阅链接" "更换订阅链接" "修改面板密码（自定义）" "重置面板密码（随机）" "重置 Zashboard 密钥（随机）" "立即申请 / 续期 / 校验证书")
   fi
   items+=(restart log update uninstall); labels+=("重启 Mihomo" "查看日志" "更新（内核 + 脚本）" "卸载")
   while :; do
-    printf '\n\033[1mclashserver 管理菜单\033[0m（%s' "$([[ $MODE == auto-cert ]] && echo "自动证书模式 · $DOMAIN" || echo '无证书模式')"
+    printf '\n\033[1mclashserver v%s 管理菜单\033[0m（%s' "$CS_VERSION" "$([[ $MODE == auto-cert ]] && echo "$(mode_label) · $DOMAIN" || echo '无证书模式')"
     printf '）  Mihomo：%s\n' "$(svc_state mihomo)"
     for i in "${!items[@]}"; do printf '  %d) %s\n' "$((i + 1))" "${labels[$i]}"; done
     printf '  0) 退出\n'
@@ -412,7 +456,17 @@ do_uninstall() {
   systemctl disable --now mihomo 2>/dev/null || true
   rm -f "$UNIT" "$BIN" "$SELF_BIN" /usr/local/bin/lego /run/clashserver-cert.lock
   systemctl daemon-reload
+  local cert_bak=""
+  if [[ ${CS_IN_REINSTALL:-0} == 1 && -d $CONF_DIR/certs ]] && ! cert_is_temp; then
+    cert_bak=$(mktemp -d)
+    cp -a "$CONF_DIR/certs/." "$cert_bak/" 2>/dev/null || true
+  fi
   rm -rf "$CONF_DIR" "$CLIENT_DIR" /var/lib/mihomo "$LIB_DIR" "$LIB_DIR.new" "$LIB_DIR.old"
+  if [[ -n $cert_bak ]]; then
+    install -d -m 750 "$CONF_DIR/certs"
+    cp -a "$cert_bak/." "$CONF_DIR/certs/" 2>/dev/null || true
+    rm -rf "$cert_bak"
+  fi
   if [[ ${CS_IN_REINSTALL:-0} == 1 && -d $ACME_HOME ]]; then
     # 重装时保留 acme.sh 账户与已签发证书：同一域名直接复用，避免触发 Let's Encrypt 频率限制（同域名每周 5 张）
     find "$CS_ETC" -mindepth 1 -maxdepth 1 ! -name "$(basename "$ACME_HOME")" -exec rm -rf {} +
@@ -432,8 +486,9 @@ while (($#)); do
     # 以下为开发/测试用隐藏参数，不写入用户文档
     -d|--domain) DOMAIN=${2:?缺少域名}; MODE=auto-cert; MODE_SET=1; shift ;;
     --cert-mode)
-      case ${2:-} in port|dns) CERT_MODE=$2; CERT_MODE_SET=1; MODE=auto-cert; MODE_SET=1 ;; *) die "未知证书申请方式：${2:-}（可选 port|dns）" ;; esac
+      case ${2:-} in port|dns|manual) CERT_MODE=$2; CERT_MODE_SET=1; MODE=auto-cert; MODE_SET=1 ;; *) die "未知证书方式：${2:-}（可选 port|dns|manual）" ;; esac
       shift ;;
+    --manual-cert) CERT_MODE=manual; CERT_MODE_SET=1; MODE=auto-cert; MODE_SET=1 ;;
     --cf-token) CF_TOKEN=${2:?缺少 Cloudflare API Token}; CERT_MODE=dns; CERT_MODE_SET=1; MODE=auto-cert; MODE_SET=1; shift ;;
     --panel-port) PANEL_PORT=${2:?缺少面板端口}; shift ;;
     --staging|--tls-staging) TLS=staging ;;
@@ -453,4 +508,3 @@ if [[ -z $ACTION ]]; then
 fi
 need_root
 "do_${ACTION//-/_}" || exit $?   # 子命令自己已提示失败原因，不再触发 ERR trap 的「第 N 行执行失败」
-

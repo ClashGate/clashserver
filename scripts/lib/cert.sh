@@ -1,9 +1,9 @@
 # shellcheck shell=bash
-# clashserver 自动证书模式：acme.sh 申请 Let's Encrypt 证书，Mihomo 入站与面板直接共用
+# clashserver 证书模式：自动申请（acme.sh 端口模式 / DNS API 模式）与手动证书模式
 
-# ------------------------------------------------------------ auto-cert mode
+# ------------------------------------------------------------ cert mode
 preflight_cert() {
-  [[ -n $DOMAIN ]] || die "自动证书模式需要域名"
+  [[ -n $DOMAIN ]] || die "证书模式需要域名"
   DOMAIN=${DOMAIN,,}
   [[ -n ${PANEL_PORT:-} ]] || PANEL_PORT=$(rand_port)
   [[ $PANEL_PORT =~ ^[0-9]+$ ]] && ((PANEL_PORT >= 1 && PANEL_PORT <= 65535)) || die "管理面板端口无效：$PANEL_PORT"
@@ -12,21 +12,23 @@ preflight_cert() {
   busy=$(ss -Hltnp "sport = :$PANEL_PORT or sport = :${CONTROLLER_PORT:-7896}" 2>/dev/null || true)
   [[ -z $busy ]] || die "端口 $PANEL_PORT / ${CONTROLLER_PORT:-7896} 已被占用，请先停止占用程序：
 $busy"
-  if [[ ${CERT_MODE:-port} == dns ]]; then
+  if [[ ${CERT_MODE:-port} == manual ]]; then
+    [[ $DOMAIN =~ $WILDCARD_DOMAIN_RE ]] || die "域名格式不正确：$DOMAIN"
+  elif [[ ${CERT_MODE:-port} == dns ]]; then
     [[ $DOMAIN =~ $WILDCARD_DOMAIN_RE ]] || die "域名格式不正确：$DOMAIN"
     [[ $TLS == internal || -n ${CF_TOKEN:-} ]] || die "DNS API 模式需要提供 Cloudflare API Token"
   else
-    [[ $DOMAIN != \*.* ]] || die "通配符域名（$DOMAIN）仅支持「DNS API 模式」"
+    [[ $DOMAIN != \*.* ]] || die "通配符域名（$DOMAIN）仅支持「DNS API 模式」或「手动证书模式」"
     [[ $DOMAIN =~ $DOMAIN_RE ]] || die "域名格式不正确：$DOMAIN"
     busy=$(ss -Hltnp 'sport = :80' 2>/dev/null || true)
-    [[ -z $busy ]] || die "80 端口已被其他程序占用（端口模式申请证书需要临时占用 80 端口），请先停止占用程序或改用「DNS API 模式」：
+    [[ -z $busy ]] || die "80 端口已被其他程序占用（端口模式申请证书需要临时占用 80 端口），请先停止占用程序或改用「DNS API 模式」/「手动证书模式」：
 $busy"
   fi
 }
 
 check_dns() {
-  # 开发自签模式或 DNS API 模式无需检查本机 A/AAAA 记录（DNS API 通过添加 TXT 记录验证，且支持泛域名）
-  [[ $TLS == internal || ${CERT_MODE:-port} == dns ]] && return 0
+  # 开发自签模式、DNS API 模式或手动证书模式无需检查本机 A/AAAA 记录
+  [[ $TLS == internal || ${CERT_MODE:-port} == dns || ${CERT_MODE:-port} == manual ]] && return 0
   local ips v6 mine6 a bad6=""
   ips=$(getent ahostsv4 "$DOMAIN" 2>/dev/null | awk '{print $1}' | sort -u | tr '\n' ' ' || true)
   # AAAA：Let's Encrypt 优先走 IPv6 验证，AAAA 指向别处（或本机没有该 IPv6）会导致申请失败
@@ -49,6 +51,84 @@ check_dns() {
     printf '已取消。请先把域名 A 记录指向 %s，再重新运行安装命令。\n' "$SERVER_IP"; exit 0
   fi
   return 0
+}
+
+auto_discover_manual_cert() {
+  local dir=$CONF_DIR/certs f
+  [[ -d $dir ]] || return 0
+  if [[ ! -s $dir/fullchain.pem ]]; then
+    for f in "$dir"/fullchain.* "$dir"/cert.pem "$dir"/*.crt "$dir"/*.cer "$dir"/*.pem; do
+      [[ -s $f && $f != "$dir/privkey.pem" && $f != *.key ]] || continue
+      if grep -q 'BEGIN CERTIFICATE' "$f" 2>/dev/null; then
+        cp -f "$f" "$dir/fullchain.pem"; break
+      fi
+    done
+  fi
+  if [[ ! -s $dir/privkey.pem ]]; then
+    for f in "$dir"/privkey.* "$dir"/key.pem "$dir"/*.key "$dir"/*.pem; do
+      [[ -s $f && $f != "$dir/fullchain.pem" ]] || continue
+      if grep -qE 'BEGIN (EC |RSA |PRIVATE )?KEY' "$f" 2>/dev/null; then
+        cp -f "$f" "$dir/privkey.pem"; break
+      fi
+    done
+  fi
+}
+
+check_manual_cert_files() {
+  local dir=$CONF_DIR/certs crt=$CONF_DIR/certs/fullchain.pem key=$CONF_DIR/certs/privkey.pem
+  local base_dom=${DOMAIN#\*.} a b
+  auto_discover_manual_cert
+  if [[ ! -s $crt || ! -s $key ]]; then
+    printf '未找到有效的证书文件，请将证书放入 %s：\n  - 证书链：%s\n  - 私钥：  %s\n' "$dir" "$crt" "$key" >&2
+    return 1
+  fi
+  if ! openssl x509 -noout -checkend 0 -in "$crt" >/dev/null 2>&1; then
+    printf '证书无效或已过期：%s\n' "$crt" >&2
+    return 1
+  fi
+  if [[ -n $base_dom ]] && ! openssl x509 -noout -checkhost "$base_dom" -in "$crt" 2>/dev/null | grep -q 'does match'; then
+    printf '证书不包含域名 %s（请检查证书与所填域名是否一致）：%s\n' "$base_dom" "$crt" >&2
+    return 1
+  fi
+  a=$(openssl x509 -noout -pubkey -in "$crt" 2>/dev/null | openssl pkey -pubin -pubout -outform DER 2>/dev/null | openssl dgst -sha256 -r | cut -d' ' -f1)
+  b=$(openssl pkey -in "$key" -pubout -outform DER 2>/dev/null | openssl dgst -sha256 -r | cut -d' ' -f1)
+  if [[ -z $a || $a != "$b" ]]; then
+    printf '证书与私钥不匹配：%s 与 %s\n' "$crt" "$key" >&2
+    return 1
+  fi
+  chown root:mihomo "$crt" "$key" 2>/dev/null || true
+  chmod 640 "$crt" "$key"
+  if id mihomo >/dev/null 2>&1; then
+    su -s /bin/sh mihomo -c "test -r $key" || { printf 'mihomo 用户无法读取证书私钥：%s\n' "$key" >&2; return 1; }
+  fi
+  return 0
+}
+
+setup_manual_cert() {
+  log "配置并校验手动证书（$DOMAIN）"
+  install -d -m 750 -o root -g mihomo "$CONF_DIR/certs"
+  info "证书存放目录：$CONF_DIR/certs/"
+  info "  证书文件：$CONF_DIR/certs/fullchain.pem（或放入 *.crt / *.pem）"
+  info "  私钥文件：$CONF_DIR/certs/privkey.pem  （或放入 *.key）"
+  if check_manual_cert_files 2>/dev/null; then
+    info "证书校验通过：$CONF_DIR/certs/（颁发者：$(cert_issuer)，到期：$(cert_enddate)）"
+    return 0
+  fi
+  if has_tty; then
+    local ans
+    while :; do
+      printf '\n请将证书与私钥放入 \033[1;36m%s/certs/\033[0m（fullchain.pem 与 privkey.pem）\n' "$CONF_DIR" >/dev/tty
+      ans=$(ask '放好后按回车键开始检测证书有效性（输入 q 取消安装）：' '')
+      [[ $ans == [qQ]* ]] && { printf '已取消安装。\n'; exit 0; }
+      if check_manual_cert_files; then
+        info "证书校验通过：$CONF_DIR/certs/（颁发者：$(cert_issuer)，到期：$(cert_enddate)）"
+        return 0
+      fi
+      printf '\033[1;33m请检查证书文件后重试。\033[0m\n' >/dev/tty
+    done
+  else
+    check_manual_cert_files || die "手动证书校验未通过（请先将 fullchain.pem 与 privkey.pem 放入 $CONF_DIR/certs/）"
+  fi
 }
 
 install_acme() { # 证书申请工具 acme.sh（与常见一键脚本相同；固定版本，装到 /etc/clashserver/acme.sh，不改 root 的 crontab / profile）
@@ -117,7 +197,7 @@ cert_last_run() { # 上次自动续期任务的结果（systemd）
 }
 
 migrate_lego() { # 旧版本（lego）-> acme.sh：update 时调用；保留当前证书，后台换由 acme.sh 管理
-  [[ $MODE == auto-cert && $TLS != internal ]] || return 0
+  [[ $MODE == auto-cert && ${CERT_MODE:-port} != manual && $TLS != internal ]] || return 0
   [[ -x $ACME_HOME/acme.sh ]] && return 0
   info "证书工具迁移：lego -> acme.sh"
   install_acme

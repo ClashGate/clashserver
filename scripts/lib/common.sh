@@ -1,15 +1,17 @@
 # shellcheck shell=bash
 # clashserver 公共函数：常量、日志、交互、环境持久化、下载与安装文件
 
+CS_VERSION=0.4
 REPO_TARBALL=https://github.com/saulsburyroy/clashserver/archive/refs/heads/main.tar.gz
 SELF_BIN=/usr/local/bin/clashserver
 BIN=/usr/local/bin/mihomo
 CONF_DIR=/etc/mihomo
 CONF=$CONF_DIR/config.yaml
 STATE=$CONF_DIR/nodes.tsv          # name port uuid private pub shortid sni
-FRAG_CONTROLLER=$CONF_DIR/controller.yaml   # external-controller-tls + zashboard (auto-cert mode)
+FRAG_CONTROLLER=$CONF_DIR/controller.yaml   # external-controller-tls + zashboard (cert modes)
 FRAG_REALITY=$CONF_DIR/listeners.reality.yaml
 FRAG_EXTRA=$CONF_DIR/listeners.extra.yaml   # owned by the panel
+FRAG_PROXIES=$CONF_DIR/proxies.extra.yaml   # outbound proxies owned by the panel
 CLIENT_DIR=/root/clashserver-client
 UNIT=/etc/systemd/system/mihomo.service
 LIB_DIR=/usr/local/lib/clashserver
@@ -24,8 +26,8 @@ DOMAIN_RE='^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$'
 WILDCARD_DOMAIN_RE='^(\*\.)?([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$'
 
 MODE=no-cert MODE_SET=0 NODES=1 VPS_NAME="" SERVER_IP=""   # NODES：默认生成 1 个 Reality 节点，更多节点在面板添加
-CERT_MODE=port CERT_MODE_SET=0 CF_TOKEN=""                 # CERT_MODE：port（端口模式）| dns（DNS API 模式）
-DOMAIN="" EMAIL="" TLS=staging PANEL_PORT=""               # 默认 Let's Encrypt staging；面板端口安装时随机选空闲高端口
+CERT_MODE=port CERT_MODE_SET=0 CF_TOKEN=""                 # CERT_MODE：port（端口模式）| dns（DNS API 模式）| manual（手动证书模式）
+DOMAIN="" EMAIL="" TLS=staging PANEL_PORT=""               # 默认 Let's Encrypt staging（仅自动申请）；面板端口随机选空闲高端口
 CONTROLLER_PORT=7896 MIHOMO_SECRET=""                      # Mihomo external-controller-tls + zashboard 端口与密钥
 PANEL_PASS="" PANEL_HASH="" SUB_TOKEN="" WARNINGS=()
 STEP=0; TOTAL=8
@@ -116,9 +118,15 @@ svc_state() {
 
 require_installed() { [[ -f $STATE ]] || die "尚未安装，请先运行一键安装命令"; }
 
-require_panel() { [[ $MODE == auto-cert && -f $PANEL_CFG ]] || die "该功能仅在自动证书模式下提供（当前：无证书模式）"; }
+require_panel() { [[ $MODE == auto-cert && -f $PANEL_CFG ]] || die "该功能仅在自动证书或手动证书模式下提供（当前：无证书模式）"; }
 
 tls_label() {
+  if [[ ${CERT_MODE:-port} == manual ]]; then
+    local iss
+    iss=$(cert_issuer 2>/dev/null || true)
+    printf '用户自备证书%s' "${iss:+（$iss）}"
+    return 0
+  fi
   case $TLS in
     staging)  printf 'Let'"'"'s Encrypt 测试证书（staging）' ;;
     internal) printf '自签证书（仅开发调试）' ;;
@@ -128,9 +136,19 @@ tls_label() {
 
 cert_mode_label() {
   case ${CERT_MODE:-port} in
-    dns) printf 'DNS API 模式' ;;
-    *)   printf '端口模式' ;;
+    dns)    printf 'DNS API 模式' ;;
+    manual) printf '手动证书模式' ;;
+    *)      printf '端口模式' ;;
   esac
+}
+
+mode_label() {
+  if [[ $MODE == auto-cert ]]; then
+    if [[ ${CERT_MODE:-port} == manual ]]; then printf '手动证书模式'
+    else printf '自动证书模式（%s）' "$(cert_mode_label)"; fi
+  else
+    printf '无证书模式'
+  fi
 }
 
 fetch_repo() { # 下载公开仓库 main 分支到目录 $1（直连 GitHub，不用任何代理）

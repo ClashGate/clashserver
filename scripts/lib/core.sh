@@ -8,8 +8,10 @@ install_deps() {
   command -v ss >/dev/null || missing+=(iproute2)
   if [[ $MODE == auto-cert ]]; then
     command -v python3 >/dev/null || missing+=(python3)
-    command -v socat >/dev/null || missing+=(socat)     # acme.sh standalone 模式需要
-    command -v getent >/dev/null || missing+=(libc-bin)
+    if [[ ${CERT_MODE:-port} != manual ]]; then
+      command -v socat >/dev/null || missing+=(socat)     # acme.sh standalone 模式需要
+      command -v getent >/dev/null || missing+=(libc-bin)
+    fi
   fi
   if ((${#missing[@]})); then
     info "apt 安装：${missing[*]}"
@@ -68,28 +70,36 @@ rand_port() {
 ensure_user() {
   id mihomo >/dev/null 2>&1 || useradd --system --no-create-home --shell /usr/sbin/nologin mihomo
   install -d -m 750 -o root -g mihomo "$CONF_DIR"
+  install -d -m 750 -o mihomo -g mihomo /var/lib/mihomo
 }
 
 gen_nodes() {
   log "生成 $NODES 个 VLESS Reality 节点"
-  : > "$STATE"; chmod 640 "$STATE"
-  local i kp priv pub
+  : > "$STATE.new"; chmod 640 "$STATE.new"
+  local i kp priv pub name
   for ((i = 1; i <= NODES; i++)); do
     kp=$("$BIN" generate reality-keypair)
     priv=$(awk '/PrivateKey/{print $2}' <<<"$kp")
     pub=$(awk '/PublicKey/{print $2}' <<<"$kp")
-    [[ -n "$priv" && -n "$pub" ]] || die "Reality 密钥对生成失败"
-    printf 'vless-reality-%d\t%s\t%s\t%s\t%s\t%s\t%s\n' "$i" "$(rand_port)" \
+    [[ -n "$priv" && -n "$pub" ]] || { rm -f "$STATE.new"; die "Reality 密钥对生成失败"; }
+    name=$([[ $i -eq 1 ]] && echo "VlessReality" || echo "VlessReality-$i")
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$name" "$(rand_port)" \
       "$(cat /proc/sys/kernel/random/uuid)" "$priv" "$pub" "$(openssl rand -hex 4)" \
-      "$REALITY_SNI" >> "$STATE"
+      "$REALITY_SNI" >> "$STATE.new"
   done
+  mv -f "$STATE.new" "$STATE"
 }
 
 validate_conf() {
   local d rc=0
   d=$(mktemp -d)
   mkdir -p "$d/ui"   # 避免 mihomo -t 校验时临时下载 external-ui
+  [[ -f /var/lib/mihomo/country.mmdb ]] && ln -s /var/lib/mihomo/country.mmdb "$d/country.mmdb"
   SAFE_PATHS=$CONF_DIR "$BIN" -t -d "$d" -f "$CONF" >/dev/null || rc=$?
+  if ((rc == 0)) && [[ -f $d/country.mmdb && ! -L $d/country.mmdb && -d /var/lib/mihomo ]]; then
+    cp -a "$d/country.mmdb" /var/lib/mihomo/country.mmdb 2>/dev/null || true
+    chown mihomo:mihomo /var/lib/mihomo/country.mmdb 2>/dev/null || true
+  fi
   rm -rf "$d"
   return "$rc"
 }
@@ -105,8 +115,10 @@ ensure_mihomo_secret() {
 render_controller() {
   if [[ $MODE == auto-cert ]]; then
     ensure_mihomo_secret
-    [[ -f $CONF_DIR/certs/fullchain.pem && -f $CONF_DIR/certs/privkey.pem ]] \
-      || "$LIB_DIR/scripts/certctl.sh" selfsign >/dev/null
+    if [[ ${CERT_MODE:-port} != manual ]]; then
+      [[ -f $CONF_DIR/certs/fullchain.pem && -f $CONF_DIR/certs/privkey.pem ]] \
+        || "$LIB_DIR/scripts/certctl.sh" selfsign >/dev/null
+    fi
     cat > "$FRAG_CONTROLLER" <<EOF
 external-controller-tls: "0.0.0.0:${CONTROLLER_PORT:-7896}"
 tls:
@@ -126,12 +138,23 @@ EOF
   chmod 640 "$FRAG_CONTROLLER"; chown root:mihomo "$FRAG_CONTROLLER"
 }
 
-# config.yaml = template with @@CONTROLLER@@ and @@LISTENERS@@ <- reality fragment + panel (extra) fragment.
+# config.yaml = template with @@CONTROLLER@@, @@PROXIES@@, and @@LISTENERS@@ <- reality + extra fragments.
 # Mirrors assemble_config() in panel/panel.py.
 assemble_config() {
   [[ -f $FRAG_CONTROLLER ]] || render_controller
-  awk -v c="$FRAG_CONTROLLER" -v r="$FRAG_REALITY" -v e="$FRAG_EXTRA" '
+  [[ -f $FRAG_PROXIES ]] || : > "$FRAG_PROXIES"
+  awk -v c="$FRAG_CONTROLLER" -v p="$FRAG_PROXIES" -v r="$FRAG_REALITY" -v e="$FRAG_EXTRA" '
     /^@@CONTROLLER@@$/ { while ((getline l < c) > 0) print l; next }
+    /^@@PROXIES@@$/    {
+      has = 0
+      while ((getline l < p) > 0) {
+        if (l ~ /^[[:space:]]*$/) continue
+        if (!has) { print "proxies:"; has = 1 }
+        print l
+      }
+      if (!has) print "proxies: []"
+      next
+    }
     /^@@LISTENERS@@$/  { while ((getline l < r) > 0) print l; while ((getline l < e) > 0) print l; next }
     { print }' "$LIB_DIR/resources/server.yaml.tpl" > "$CONF.new"
   chmod 640 "$CONF.new"; chown root:mihomo "$CONF.new"
@@ -145,6 +168,7 @@ render_server() {
   while IFS=$'\t' read -r name port uuid priv pub sid sni; do
     listeners+="  - name: $name
     type: vless
+    udp: true
     port: $port
     listen: 0.0.0.0
     users:
@@ -162,8 +186,9 @@ render_server() {
   done < "$STATE"
   printf '%s' "$listeners" > "$FRAG_REALITY"
   [[ -f $FRAG_EXTRA ]] || : > "$FRAG_EXTRA"
-  chmod 640 "$FRAG_REALITY" "$FRAG_EXTRA"
-  chown root:mihomo "$FRAG_REALITY" "$FRAG_EXTRA" "$STATE"
+  [[ -f $FRAG_PROXIES ]] || : > "$FRAG_PROXIES"
+  chmod 640 "$FRAG_REALITY" "$FRAG_EXTRA" "$FRAG_PROXIES"
+  chown root:mihomo "$FRAG_REALITY" "$FRAG_EXTRA" "$FRAG_PROXIES" "$STATE"
   assemble_config
   validate_conf || die "生成的服务端配置未通过校验（mihomo -t）"
 }

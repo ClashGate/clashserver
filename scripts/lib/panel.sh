@@ -25,6 +25,7 @@ setup_panel() {
   log "配置管理面板"
   install -d -m 755 "$CS_ETC"
   [[ -f $CS_ETC/inbounds.json ]] || { echo '[]' > "$CS_ETC/inbounds.json"; chmod 600 "$CS_ETC/inbounds.json"; }
+  [[ -f $CS_ETC/proxies.json ]]  || { echo '[]' > "$CS_ETC/proxies.json";  chmod 600 "$CS_ETC/proxies.json"; }
   set_panel_password
   install -m 644 "$LIB_DIR/scripts/init/clashserve.service" /etc/systemd/system/clashserve.service
   systemctl daemon-reload
