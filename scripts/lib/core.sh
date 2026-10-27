@@ -95,11 +95,14 @@ gen_nodes() {
 }
 
 validate_conf() {
-  local d rc=0
+  local d rc=0 f
   d=$(mktemp -d)
   mkdir -p "$d/ui"   # 避免 mihomo -t 校验时临时下载 external-ui
   [[ -d $CONF_DIR/certs ]] && ln -s "$CONF_DIR/certs" "$d/certs"
-  [[ -f $CONF_DIR/country.mmdb ]] && ln -s "$CONF_DIR/country.mmdb" "$d/country.mmdb"
+  [[ -d $CONF_DIR/ruleset ]] && ln -s "$CONF_DIR/ruleset" "$d/ruleset"
+  for f in "$CONF_DIR"/*.mmdb "$CONF_DIR"/*.dat; do
+    [[ -f $f ]] && ln -s "$f" "$d/$(basename "$f")"
+  done
   SAFE_PATHS="$CONF_DIR:/etc/mihomo" "$BIN" -t -d "$d" -f "$CONF" >/dev/null || rc=$?
   if ((rc == 0)) && [[ -f $d/country.mmdb && ! -L $d/country.mmdb && -d $CONF_DIR ]]; then
     cp -a "$d/country.mmdb" "$CONF_DIR/country.mmdb" 2>/dev/null || true
@@ -229,26 +232,28 @@ proxy_line() { # name port uuid pub sid sni
 
 render_client() {
   log "生成客户端配置"
-  local proxies="" names="" name port uuid priv pub sid sni line cname
+  local proxies="" names="" name port uuid priv pub sid sni line cname p_arg n_arg
   while IFS=$'\t' read -r name port uuid priv pub sid sni; do
     [[ -n $name ]] || continue
     line=$(proxy_line "$name" "$port" "$uuid" "$pub" "$sid" "$sni")
-    proxies+="    - $line"$'\n'
+    proxies+="  - $line"$'\n'
     names+="      - \"$VPS_NAME-$name|Clash|Reality\""$'\n'
   done < "$STATE"
   if [[ -f $CS_ETC/inbounds.json ]]; then
     while IFS=$'\t' read -r line cname; do
       [[ -n $line ]] || continue
-      proxies+="    - $line"$'\n'
+      proxies+="  - $line"$'\n'
       names+="      - $cname"$'\n'
     done < <(jq -r '.[] | "\(.client | tojson)\t\(.client.name | tojson)"' "$CS_ETC/inbounds.json" 2>/dev/null || true)
   fi
   install -d -m 700 "$CLIENT_DIR"
-  awk -v p="${proxies%$'\n'}" -v n="${names%$'\n'}" \
-    '/^@@PROXIES@@$/{print p; next} /^@@PROXY_NAMES@@$/{print n; next} {print}' \
+  p_arg="${proxies%$'\n'}"; [[ -n $p_arg ]] || p_arg="  []"
+  n_arg="${names%$'\n'}";   [[ -n $n_arg ]] || n_arg='      - "DIRECT"'
+  P="$p_arg" N="$n_arg" awk \
+    '/^@@PROXIES@@$/{print ENVIRON["P"]; next} /^@@PROXY_NAMES@@$/{print ENVIRON["N"]; next} {print}' \
     "$LIB_DIR/resources/client.yaml.tpl" > "$CLIENT_DIR/mihomo-client.yaml"
   chmod 600 "$CLIENT_DIR/mihomo-client.yaml"
-  { echo "proxies:"; printf '%s' "$proxies"; } > "$CLIENT_DIR/proxies.yaml"
+  { echo "proxies:"; printf '%s' "${proxies:-  []$'\n'}"; } > "$CLIENT_DIR/proxies.yaml"
   chmod 600 "$CLIENT_DIR/proxies.yaml"
   [[ -e /root/clashserver-client ]] || ln -sfn "$CLIENT_DIR" /root/clashserver-client
 }

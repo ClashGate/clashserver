@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""clashserve v0.5 - rebuilt admin console for clashserver (certificate modes).
+"""clashserve v0.55 - rebuilt admin console for clashserver (certificate modes).
 
 Stdlib only (Debian python3). Serves HTTPS itself with the same certificate
 Mihomo uses (/etc/clashserve/certs); no reverse proxy.
@@ -33,7 +33,7 @@ import uuid as uuidlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse, quote
 
-VERSION = "0.5"
+VERSION = "0.55"
 
 # CLASHSERVER_ROOT lets the panel run against a fake tree for local testing.
 ROOT = os.environ.get("CLASHSERVER_ROOT", "")
@@ -172,7 +172,10 @@ def read_env() -> dict:
                 for line in f:
                     m = re.match(r"^([A-Z_]+)=(.*)$", line.strip())
                     if m:
-                        env[m.group(1)] = m.group(2).strip("'\"")
+                        val = m.group(2).strip()
+                        if (val.startswith('"') and val.endswith('"')) or (val.startswith("'") and val.endswith("'")):
+                            val = val[1:-1]
+                        env[m.group(1)] = val
             break
         except FileNotFoundError:
             continue
@@ -246,6 +249,21 @@ def read_nodes() -> list:
 
 
 def get_controller_port(env: dict = None) -> int:
+    if is_custom_config_mode():
+        try:
+            with open(CUSTOM_CONF) as f:
+                txt = f.read()
+            for pat in (
+                r'^\s*external-controller-tls\s*:\s*["\']?[^"\':\s]+:(\d+)',
+                r'^\s*external-controller\s*:\s*["\']?[^"\':\s]+:(\d+)',
+            ):
+                m = re.search(pat, txt, re.M)
+                if m:
+                    p = int(m.group(1))
+                    if 1 <= p <= 65535:
+                        return p
+        except Exception:
+            pass
     if env is None:
         env = read_env()
     try:
@@ -257,12 +275,46 @@ def get_controller_port(env: dict = None) -> int:
     try:
         with open(CONF) as f:
             txt = f.read()
-        m = re.search(r'external-controller-tls:\s*["\']?[^"\':\s]+:(\d+)', txt)
-        if m:
-            return int(m.group(1))
+        for pat in (
+            r'^\s*external-controller-tls\s*:\s*["\']?[^"\':\s]+:(\d+)',
+            r'^\s*external-controller\s*:\s*["\']?[^"\':\s]+:(\d+)',
+        ):
+            m = re.search(pat, txt, re.M)
+            if m:
+                return int(m.group(1))
     except Exception:
         pass
     return 7896
+
+
+def extract_yaml_secret(raw_yaml: str):
+    """Extract top-level `secret:` scalar from raw YAML without truncating on `#` or `%` inside quotes."""
+    for raw_line in raw_yaml.splitlines():
+        expanded = raw_line.expandtabs(2)
+        stripped = expanded.lstrip(" ")
+        indent = len(expanded) - len(stripped)
+        if indent != 0 or not stripped or stripped.startswith("#"):
+            continue
+        cleaned = strip_yaml_comment(stripped)
+        k, sep, v = split_kv(cleaned)
+        if sep and k == "secret":
+            val = parse_scalar(v, "secret")
+            return "" if val is None else str(val)
+    return None
+
+
+def get_mihomo_secret(env: dict = None) -> str:
+    if is_custom_config_mode():
+        try:
+            with open(CUSTOM_CONF) as f:
+                sec = extract_yaml_secret(f.read())
+            if sec is not None:
+                return sec
+        except Exception:
+            pass
+    if env is None:
+        env = read_env()
+    return env.get("MIHOMO_SECRET", "")
 
 
 def used_ports(env) -> set:
@@ -330,15 +382,15 @@ def server_config_url(env: dict, cfg: dict) -> str:
 
 
 def zashboard_url(env: dict) -> str:
-    """Return Zashboard HTTPS URL with API Secret appended for one-click copy & direct login."""
+    """Return Zashboard HTTPS URL with fully URL-encoded API Secret appended for one-click direct login."""
     host = env.get("DOMAIN", "").removeprefix("*.") or env.get("SERVER_IP", "")
     if not host:
         return ""
     cport = get_controller_port(env)
-    secret = env.get("MIHOMO_SECRET", "")
+    secret = get_mihomo_secret(env)
     if not secret:
         return f"https://{host}:{cport}/ui/"
-    qs = f"hostname={quote(host)}&port={cport}&secret={quote(secret)}&https=true"
+    qs = f"hostname={quote(host, safe='')}&port={cport}&secret={quote(secret, safe='')}&https=true"
     return f"https://{host}:{cport}/ui/#/setup?{qs}"
 
 
@@ -568,7 +620,18 @@ def parse_yaml_lines(lines: list, idx: int = 0, min_indent: int = 0):
             if not sep:
                 raise ValueError(f"无效的 YAML 行：{txt}")
             idx += 1
-            if v:
+            if v in ("|", "|-", "|+", ">", ">-", ">+"):
+                blk = []
+                blk_indent = None
+                while idx < len(lines) and lines[idx][0] > map_indent:
+                    b_ind, b_txt = lines[idx]
+                    if blk_indent is None:
+                        blk_indent = b_ind
+                    pad = " " * max(0, b_ind - blk_indent)
+                    blk.append(pad + b_txt)
+                    idx += 1
+                mapping[k] = "\n".join(blk)
+            elif v:
                 mapping[k] = parse_flow_val(v, k)
             else:
                 if idx < len(lines) and lines[idx][0] >= map_indent:
@@ -771,11 +834,7 @@ def build_proxy_provider(url: str, name: str = "", existing: dict = None) -> tup
 # ---------------------------------------------------------------- custom server config helpers
 def rewrite_cert_paths_in_yaml(raw_yaml: str, env: dict = None) -> tuple:
     """Automatically rewrite TLS certificate/private-key paths in user server config to /etc/clashserve/certs/*.
-    Never modifies private-key inside reality-config blocks. Also fills controller port/secret placeholders if present."""
-    if env is None:
-        env = read_env()
-    cport = get_controller_port(env)
-    secret = env.get("MIHOMO_SECRET", "")
+    Never modifies private-key inside reality-config blocks."""
     lines = raw_yaml.splitlines()
     out = []
     in_reality = False
@@ -808,18 +867,6 @@ def rewrite_cert_paths_in_yaml(raw_yaml: str, env: dict = None) -> tuple:
                 changed += 1
                 out.append(line)
                 continue
-            # Replace placeholder external-controller-tls port if present
-            if re.match(r"^external-controller-tls\s*:", stripped) and "随机端口" in stripped:
-                line = (" " * indent) + f'external-controller-tls: "0.0.0.0:{cport}"'
-                changed += 1
-                out.append(line)
-                continue
-            # Replace placeholder secret if present
-            if secret and re.match(r"^secret\s*:", stripped) and "填充随机密码" in stripped:
-                line = (" " * indent) + f'secret: "{secret}"'
-                changed += 1
-                out.append(line)
-                continue
             # Rewrite certificate:
             m_cert = re.match(r"^((?:-\s+)?certificate\s*:\s*)([^#\n]+?)(\s*(?:#.*)?)$", stripped)
             if m_cert:
@@ -847,16 +894,359 @@ def rewrite_cert_paths_in_yaml(raw_yaml: str, env: dict = None) -> tuple:
 
 def sync_env_from_custom_config(raw_yaml: str):
     """Sync CONTROLLER_PORT and MIHOMO_SECRET from a custom server config if present."""
-    m_port = re.search(r'^\s*external-controller-tls\s*:\s*["\']?[^"\':\s]+:(\d+)["\']?', raw_yaml, re.M)
-    if m_port:
-        p = int(m_port.group(1))
-        if 1 <= p <= 65535:
-            write_env_var("CONTROLLER_PORT", str(p))
-    m_sec = re.search(r'^\s*secret\s*:\s*["\']?([^"\'#\r\n]+?)["\']?\s*(?:#.*)?$', raw_yaml, re.M)
-    if m_sec:
-        sec = m_sec.group(1).strip()
-        if sec and sec != "填充随机密码":
-            write_env_var("MIHOMO_SECRET", sec)
+    for pat in (
+        r'^\s*external-controller-tls\s*:\s*["\']?[^"\':\s]+:(\d+)["\']?',
+        r'^\s*external-controller\s*:\s*["\']?[^"\':\s]+:(\d+)["\']?',
+    ):
+        m_port = re.search(pat, raw_yaml, re.M)
+        if m_port:
+            p = int(m_port.group(1))
+            if 1 <= p <= 65535:
+                write_env_var("CONTROLLER_PORT", str(p))
+                break
+    sec = extract_yaml_secret(raw_yaml)
+    if sec:
+        write_env_var("MIHOMO_SECRET", sec)
+
+
+def x25519_pub_from_priv(priv_b64: str) -> str:
+    """Derive base64url X25519 public key from a 32-byte base64url/base64 X25519 private key via openssl."""
+    s = (priv_b64 or "").strip()
+    if not s:
+        return ""
+    try:
+        pad = "=" * ((4 - len(s) % 4) % 4)
+        raw_priv = base64.urlsafe_b64decode(s + pad) if ("-" in s or "_" in s) else base64.b64decode(s + pad)
+        if len(raw_priv) != 32:
+            return s
+        der_priv = bytes.fromhex("302e020100300506032b656e04220420") + raw_priv
+        p = subprocess.run(["openssl", "pkey", "-inform", "DER", "-pubout", "-outform", "DER"],
+                           input=der_priv, capture_output=True, timeout=5)
+        if p.returncode == 0 and len(p.stdout) >= 32:
+            return base64.urlsafe_b64encode(p.stdout[-32:]).decode().rstrip("=")
+    except Exception:
+        pass
+    return s
+
+
+def derive_vless_encryption(dec_str: str) -> str:
+    """Convert server VLESS `decryption` string into client `encryption` string."""
+    s = (dec_str or "").strip()
+    if not s or s == "none":
+        return ""
+    parts = s.split(".")
+    out = []
+    for seg in parts:
+        if re.fullmatch(r"\d+s", seg):
+            out.append("0rtt")
+        elif len(seg) in (43, 44) and re.fullmatch(r"[A-Za-z0-9_+=-]+", seg):
+            out.append(x25519_pub_from_priv(seg))
+        else:
+            out.append(seg)
+    return ".".join(out)
+
+
+def extract_top_level_yaml_section(raw_yaml: str, section_key: str):
+    """Extract and parse a top-level YAML section (e.g. listeners, proxies, proxy-providers)."""
+    lines = []
+    in_sec = False
+    for raw_line in raw_yaml.splitlines():
+        cleaned = strip_yaml_comment(raw_line.expandtabs(2))
+        if not cleaned.strip():
+            continue
+        stripped = cleaned.lstrip(" ")
+        indent = len(cleaned) - len(stripped)
+        if not in_sec:
+            if indent == 0:
+                k, sep, v = split_kv(stripped)
+                if sep and k == section_key:
+                    in_sec = True
+                    lines.append((0, stripped))
+        else:
+            if indent == 0 and not (stripped == "-" or stripped.startswith("- ")):
+                break
+            lines.append((indent, stripped))
+    if not lines:
+        return None
+    try:
+        parsed, _ = parse_yaml_lines(lines, 0, 0)
+        if isinstance(parsed, dict):
+            return parsed.get(section_key)
+    except Exception as e:
+        sys.stderr.write(f"extract_top_level_yaml_section({section_key}) warning: {e}\n")
+    return None
+
+
+def _first_user_creds(users_val) -> tuple:
+    """Extract (username, password, uuid, flow, alterId) from a listener's `users` field (list or dict)."""
+    if isinstance(users_val, list) and users_val:
+        u0 = users_val[0]
+        if isinstance(u0, dict):
+            return (
+                str(u0.get("username", "user")),
+                str(u0.get("password", "")),
+                str(u0.get("uuid", "")),
+                str(u0.get("flow", "")),
+                int(u0.get("alterId", 0) or 0),
+            )
+    elif isinstance(users_val, dict) and users_val:
+        k, v = next(iter(users_val.items()))
+        return str(k), str(v), str(k), "", 0
+    return "user", "", "", "", 0
+
+
+def listener_to_inbound(lst: dict, env: dict, existing_by_name: dict = None) -> dict:
+    """Convert a Mihomo server listener dict into an inbound record with a complete client proxy dict."""
+    if not isinstance(lst, dict):
+        raise ValueError("Invalid listener entry")
+    name = str(lst.get("name") or "").strip()
+    ltype = str(lst.get("type") or "").strip().lower()
+    port = int(lst.get("port") or 0)
+    if not name or not ltype or not (1 <= port <= 65535):
+        raise ValueError(f"Invalid listener name/type/port: {lst}")
+
+    prev = (existing_by_name or {}).get(name)
+    iid = prev["id"] if (prev and prev.get("id")) else secrets.token_hex(6)
+    created = prev["created"] if (prev and prev.get("created")) else int(time.time())
+
+    vps = env.get("VPS_NAME", "vps")
+    ip = env.get("SERVER_IP", "")
+    domain = env.get("DOMAIN", "").removeprefix("*.") or ip
+    insecure = env.get("CERT_MODE") != "manual" and env.get("TLS", "") in ("staging", "internal")
+    label = f"{vps}-{name}"
+    has_cert = bool(lst.get("certificate"))
+    srv = domain if has_cert else ip
+    user, pw, uid, flow, alter_id = _first_user_creds(lst.get("users"))
+
+    if ltype == "vless" and isinstance(lst.get("reality-config"), dict):
+        kind = "vless-reality"
+        rcfg = lst["reality-config"]
+        snames = rcfg.get("server-names")
+        sni = (snames[0] if isinstance(snames, list) and snames else str(rcfg.get("dest", REALITY_SNI)).split(":")[0]).strip()
+        sids = rcfg.get("short-id")
+        sid = str(sids[0] if isinstance(sids, list) and sids else (sids or "")).strip()
+        priv = str(rcfg.get("private-key") or "").strip()
+        pub = ""
+        if prev and isinstance(prev.get("client"), dict):
+            prev_ropts = prev["client"].get("reality-opts") or {}
+            if prev.get("listener", {}).get("reality-config", {}).get("private-key") == priv:
+                pub = prev_ropts.get("public-key", "")
+        if not pub:
+            pub = x25519_pub_from_priv(priv)
+        client = {
+            "name": f"{label}|Clash|Reality", "type": "vless", "server": ip, "port": port,
+            "uuid": uid, "tls": True, "flow": flow or "xtls-rprx-vision",
+            "client-fingerprint": "safari", "skip-cert-verify": False,
+            "reality-opts": {"public-key": pub, "short-id": sid},
+            "network": "tcp", "udp": True, "servername": sni,
+        }
+    elif ltype == "vless":
+        kind = "vless"
+        client = {
+            "name": f"{label}|Clash|VLESS", "type": "vless", "server": srv, "port": port,
+            "uuid": uid, "tls": has_cert, "udp": True,
+        }
+        if has_cert:
+            client["servername"] = domain
+            client["skip-cert-verify"] = insecure
+            client["client-fingerprint"] = "chrome"
+        if isinstance(lst.get("xhttp-config"), dict):
+            xcfg = lst["xhttp-config"]
+            xopts = {"path": str(xcfg.get("path", "/")), "mode": str(xcfg.get("mode", "auto"))}
+            if xcfg.get("x-padding-bytes"):
+                xopts["x-padding-bytes"] = str(xcfg["x-padding-bytes"])
+            client["network"] = "xhttp"
+            client["xhttp-opts"] = xopts
+        elif lst.get("ws-path"):
+            wpath = str(lst["ws-path"])
+            client["network"] = "ws"
+            client["ws-opts"] = {"path": wpath, "headers": {"Host": srv}}
+        elif lst.get("grpc-service-name"):
+            client["network"] = "grpc"
+            client["grpc-opts"] = {"grpc-service-name": str(lst["grpc-service-name"])}
+        else:
+            client["network"] = "tcp"
+            if flow:
+                client["flow"] = flow
+        if lst.get("decryption") and str(lst.get("decryption")) != "none":
+            enc = ""
+            if prev and isinstance(prev.get("client"), dict) and prev.get("listener", {}).get("decryption") == lst.get("decryption"):
+                enc = prev["client"].get("encryption", "")
+            if not enc:
+                enc = derive_vless_encryption(str(lst["decryption"]))
+            if enc:
+                client["encryption"] = enc
+    elif ltype in ("shadowsocks", "ss"):
+        kind = "shadowsocks"
+        client = {
+            "name": f"{label}|Clash|SS", "type": "ss", "server": ip, "port": port,
+            "cipher": str(lst.get("cipher", "aes-128-gcm")),
+            "password": str(lst.get("password", pw)), "udp": True,
+        }
+    elif ltype == "hysteria2":
+        kind = "hysteria2"
+        alpn = lst.get("alpn") if isinstance(lst.get("alpn"), list) else ["h3"]
+        client = {
+            "name": f"{label}|Clash|Hy2", "type": "hysteria2", "server": domain, "port": port,
+            "password": str(lst.get("password") or pw), "sni": domain, "alpn": alpn,
+            "skip-cert-verify": insecure, "udp": True,
+        }
+        if lst.get("obfs"):
+            client["obfs"] = str(lst["obfs"])
+            if lst.get("obfs-password"):
+                client["obfs-password"] = str(lst["obfs-password"])
+    elif ltype == "hysteria2-realm":
+        kind = "hysteria2-realm"
+        alpn = lst.get("alpn") if isinstance(lst.get("alpn"), list) else ["h2", "http/1.1"]
+        client = {
+            "name": f"{label}|Clash|Hy2Realm", "type": "hysteria2", "server": domain, "port": port,
+            "password": str(lst.get("token") or pw), "sni": domain, "alpn": alpn,
+            "skip-cert-verify": insecure, "udp": True,
+        }
+    elif ltype == "anytls":
+        kind = "anytls"
+        client = {
+            "name": f"{label}|Clash|AnyTLS", "type": "anytls", "server": domain, "port": port,
+            "password": str(lst.get("password") or pw), "sni": domain,
+            "client-fingerprint": "chrome", "skip-cert-verify": insecure, "udp": True,
+        }
+    elif ltype == "vmess":
+        kind = "vmess"
+        client = {
+            "name": f"{label}|Clash|VMess", "type": "vmess", "server": srv, "port": port,
+            "uuid": uid, "alterId": alter_id, "cipher": "auto", "tls": has_cert, "udp": True,
+        }
+        if has_cert:
+            client["servername"] = domain
+            client["skip-cert-verify"] = insecure
+            client["client-fingerprint"] = "chrome"
+        if lst.get("ws-path"):
+            wpath = str(lst["ws-path"])
+            client["network"] = "ws"
+            client["ws-opts"] = {"path": wpath, "headers": {"Host": srv}}
+        elif lst.get("grpc-service-name"):
+            client["network"] = "grpc"
+            client["grpc-opts"] = {"grpc-service-name": str(lst["grpc-service-name"])}
+    elif ltype == "trusttunnel":
+        kind = "trusttunnel"
+        client = {
+            "name": f"{label}|Clash|TrustTunnel", "type": "trusttunnel", "server": domain,
+            "port": port, "username": user, "password": pw, "sni": domain,
+            "skip-cert-verify": insecure, "udp": True,
+        }
+    elif ltype == "snell":
+        kind = "snell"
+        ver = int(lst.get("version") or 5)
+        obfs = lst.get("obfs-opts") if isinstance(lst.get("obfs-opts"), dict) else {"mode": "tls", "host": REALITY_SNI}
+        client = {
+            "name": f"{label}|Clash|Snell", "type": "snell", "server": ip, "port": port,
+            "psk": str(lst.get("psk", "")), "version": ver, "udp": True, "obfs-opts": obfs,
+        }
+    elif ltype == "tuic":
+        kind = "tuic"
+        cc = str(lst.get("congestion-controller") or "bbr")
+        alpn = lst.get("alpn") if isinstance(lst.get("alpn"), list) else ["h3"]
+        client = {
+            "name": f"{label}|Clash|TUICv5", "type": "tuic", "server": domain, "port": port,
+            "uuid": uid, "password": pw, "sni": domain, "alpn": alpn,
+            "congestion-controller": cc, "udp-relay-mode": "native",
+            "reduce-rtt": True, "skip-cert-verify": insecure, "udp": True,
+        }
+    elif ltype == "shadowquic":
+        kind = "shadowquic"
+        jls_up = lst.get("jls-upstream") if isinstance(lst.get("jls-upstream"), dict) else {}
+        jls_addr = str(jls_up.get("addr") or "www.microsoft.com:443")
+        jls_host = jls_addr.rsplit(":", 1)[0]
+        cc = str(lst.get("congestion-controller") or "bbr")
+        zrtt = bool(lst.get("zero-rtt", True))
+        client = {
+            "name": f"{label}|Clash|ShadowQUIC", "type": "shadowquic", "server": ip, "port": port,
+            "username": user, "password": pw, "sni": jls_host, "alpn": ["h3"],
+            "congestion-controller": cc, "zero-rtt": zrtt, "udp": True,
+        }
+    elif ltype == "mieru":
+        kind = "mieru"
+        tr = str(lst.get("transport") or "TCP").upper()
+        client = {
+            "name": f"{label}|Clash|Mieru", "type": "mieru", "server": ip, "port": port,
+            "transport": tr, "username": user, "password": pw, "udp": True,
+        }
+    elif ltype == "sudoku":
+        kind = "sudoku"
+        priv_k = str(lst.get("key", ""))
+        if prev and isinstance(prev.get("client"), dict) and prev["client"].get("key"):
+            priv_k = prev["client"]["key"]
+        client = {
+            "name": f"{label}|Clash|Sudoku", "type": "sudoku", "server": ip, "port": port,
+            "key": priv_k, "aead-method": str(lst.get("aead-method", "chacha20-poly1305")),
+            "padding-min": int(lst.get("padding-min", 2)), "padding-max": int(lst.get("padding-max", 7)),
+            "table-type": str(lst.get("table-type", "prefer_ascii")),
+            "enable-pure-downlink": bool(lst.get("enable-pure-downlink", True)), "udp": True,
+        }
+    elif ltype == "http":
+        kind = "http"
+        client = {
+            "name": f"{label}|Clash|HTTP", "type": "http", "server": srv, "port": port,
+            "username": user, "password": pw, "tls": has_cert, "udp": True,
+        }
+        if has_cert:
+            client["sni"] = domain
+            client["skip-cert-verify"] = insecure
+    else:  # socks, socks5, mixed
+        kind = "mixed" if ltype == "mixed" else "socks"
+        tag = "Mixed" if ltype == "mixed" else "SOCKS5"
+        client = {
+            "name": f"{label}|Clash|{tag}", "type": "socks5", "server": srv, "port": port,
+            "username": user, "password": pw, "tls": has_cert, "udp": True,
+        }
+        if has_cert:
+            client["skip-cert-verify"] = insecure
+
+    return {
+        "id": iid, "kind": kind, "port": port, "name": name,
+        "created": created, "listener": lst, "client": client,
+    }
+
+
+def parse_custom_config_state(raw_yaml: str, env: dict = None) -> tuple:
+    """Parse listeners, proxies, and proxy-providers from a full server YAML config."""
+    if env is None:
+        env = read_env()
+    existing_by_name = {}
+    for n in read_nodes():
+        rc_inb = {
+            "id": secrets.token_hex(6), "kind": "vless-reality", "port": n["port"],
+            "name": n["name"], "created": int(time.time()),
+            "listener": {"reality-config": {"private-key": n["priv"]}},
+            "client": reality_client(n, env),
+        }
+        existing_by_name[n["name"]] = rc_inb
+    for i in load_inbounds():
+        existing_by_name[i["name"]] = i
+
+    raw_listeners = extract_top_level_yaml_section(raw_yaml, "listeners")
+    new_inbounds = []
+    if isinstance(raw_listeners, list):
+        for item in raw_listeners:
+            if isinstance(item, dict):
+                try:
+                    new_inbounds.append(listener_to_inbound(item, env, existing_by_name))
+                except Exception as e:
+                    sys.stderr.write(f"listener_to_inbound warning: {e}\n")
+
+    raw_proxies = extract_top_level_yaml_section(raw_yaml, "proxies")
+    new_proxies = []
+    if isinstance(raw_proxies, list):
+        for p in raw_proxies:
+            if isinstance(p, dict) and p.get("name") and p.get("type"):
+                node = dict(p)
+                if "udp" not in node or node["udp"] is None:
+                    node["udp"] = True
+                new_proxies.append(node)
+
+    raw_providers = extract_top_level_yaml_section(raw_yaml, "proxy-providers")
+    new_providers = raw_providers if isinstance(raw_providers, dict) else {}
+    return new_inbounds, new_proxies, new_providers
 
 
 # ---------------------------------------------------------------- inbound model
@@ -1278,8 +1668,21 @@ def validate_config(path=CONF):
                 except OSError:
                     pass
                 break
+        if os.path.isdir(CS_ROOT):
+            for entry in os.listdir(CS_ROOT):
+                if entry in ("ui", "certs", "config.yaml", "custom_config.yaml", "panel.json", "clashserver.env"):
+                    continue
+                src_p = os.path.join(CS_ROOT, entry)
+                dst_p = os.path.join(d, entry)
+                if (entry in ("ruleset", "zerotier", "tailscale")
+                        or entry.endswith((".mmdb", ".dat", ".yaml", ".yml", ".mrs"))):
+                    if not os.path.exists(dst_p):
+                        try:
+                            os.symlink(src_p, dst_p)
+                        except OSError:
+                            pass
         for mmdb in (CS_ROOT + "/country.mmdb", ROOT + "/var/lib/mihomo/country.mmdb"):
-            if os.path.isfile(mmdb):
+            if os.path.isfile(mmdb) and not os.path.exists(os.path.join(d, "country.mmdb")):
                 try:
                     os.symlink(mmdb, os.path.join(d, "country.mmdb"))
                 except OSError:
@@ -1295,7 +1698,20 @@ def validate_config(path=CONF):
                 with open(test_path, "w") as fp:
                     fp.write(txt.replace("/etc/clashserve/certs/", CS_ROOT + "/certs/"))
         env = dict(os.environ, SAFE_PATHS=safe)
-        return run([resolve_mihomo_bin(), "-t", "-d", d, "-f", test_path], env=env, timeout=60)
+        rc, out = run([resolve_mihomo_bin(), "-t", "-d", d, "-f", test_path], env=env, timeout=90)
+        if rc == 0 and os.path.isdir(CS_ROOT):
+            for entry in os.listdir(d):
+                if entry in ("ui", "certs", "test_config.yaml"):
+                    continue
+                src_p = os.path.join(d, entry)
+                dst_p = os.path.join(CS_ROOT, entry)
+                if os.path.islink(src_p) or os.path.exists(dst_p):
+                    continue
+                try:
+                    shutil.move(src_p, dst_p)
+                except Exception:
+                    pass
+        return rc, out
 
 
 def ufw_specs_for_node(kind: str, port: int) -> set:
@@ -1337,10 +1753,84 @@ def sync_client_files():
         proxies = [reality_client(n, env) for n in read_nodes()] + [i["client"] for i in load_inbounds()]
         os.makedirs(CLIENT_DIR, mode=0o700, exist_ok=True)
         atomic_write(CLIENT_DIR + "/mihomo-client.yaml", render_subscription(env), 0o600)
-        p_yaml = "proxies:\n" + "".join("    - " + json.dumps(p, ensure_ascii=False) + "\n" for p in proxies)
-        atomic_write(CLIENT_DIR + "/proxies.yaml", p_yaml, 0o600)
+        p_body = "".join("  - " + json.dumps(p, ensure_ascii=False) + "\n" for p in proxies) if proxies else "  []\n"
+        atomic_write(CLIENT_DIR + "/proxies.yaml", "proxies:\n" + p_body, 0o600)
     except Exception as e:
         sys.stderr.write(f"sync_client_files warning: {e}\n")
+
+
+def replace_top_level_yaml_section(raw_yaml: str, section_key: str, new_block: str) -> str:
+    """Replace or append a top-level YAML section in raw_yaml."""
+    lines = raw_yaml.splitlines()
+    out = []
+    in_sec = False
+    replaced = False
+    for line in lines:
+        cleaned = strip_yaml_comment(line.expandtabs(2))
+        stripped = cleaned.lstrip(" ")
+        indent = len(cleaned) - len(stripped)
+        if not in_sec:
+            if stripped and indent == 0:
+                k, sep, _ = split_kv(stripped)
+                if sep and k == section_key:
+                    in_sec = True
+                    replaced = True
+                    if new_block.strip():
+                        out.append(new_block.rstrip("\n"))
+                    continue
+            out.append(line)
+        else:
+            if stripped and indent == 0 and not (stripped == "-" or stripped.startswith("- ")):
+                in_sec = False
+                out.append(line)
+    if not replaced and new_block.strip():
+        if out and out[-1].strip():
+            out.append("")
+        out.append(new_block.rstrip("\n"))
+    return "\n".join(out) + "\n"
+
+
+def _sync_custom_conf_listeners(nodes: list, inbounds: list):
+    """When in custom config mode, keep CUSTOM_CONF's `listeners:` block in sync with panel edits."""
+    if not is_custom_config_mode():
+        return
+    try:
+        with open(CUSTOM_CONF) as f:
+            raw = f.read()
+        l_body = render_reality(nodes) + dump_yaml_proxies([i["listener"] for i in inbounds])
+        new_block = ("listeners:\n" + l_body) if l_body.strip() else "listeners: []\n"
+        updated = replace_top_level_yaml_section(raw, "listeners", new_block)
+        atomic_write(CUSTOM_CONF, updated, 0o640)
+    except Exception as e:
+        sys.stderr.write(f"_sync_custom_conf_listeners warning: {e}\n")
+
+
+def _sync_custom_conf_proxies(proxies: list):
+    if not is_custom_config_mode():
+        return
+    try:
+        with open(CUSTOM_CONF) as f:
+            raw = f.read()
+        p_body = dump_yaml_proxies(proxies)
+        new_block = ("proxies:\n" + p_body) if p_body.strip() else "proxies: []\n"
+        updated = replace_top_level_yaml_section(raw, "proxies", new_block)
+        atomic_write(CUSTOM_CONF, updated, 0o640)
+    except Exception as e:
+        sys.stderr.write(f"_sync_custom_conf_proxies warning: {e}\n")
+
+
+def _sync_custom_conf_providers(providers: dict):
+    if not is_custom_config_mode():
+        return
+    try:
+        with open(CUSTOM_CONF) as f:
+            raw = f.read()
+        pv_body = dump_yaml_providers(providers)
+        new_block = ("proxy-providers:\n" + pv_body) if pv_body.strip() else ""
+        updated = replace_top_level_yaml_section(raw, "proxy-providers", new_block)
+        atomic_write(CUSTOM_CONF, updated, 0o640)
+    except Exception as e:
+        sys.stderr.write(f"_sync_custom_conf_providers warning: {e}\n")
 
 
 def wait_mihomo_ports(timeout=2.0):
@@ -1365,7 +1855,7 @@ def apply_inbounds(new: list):
     """Write inbounds + fragment + config, validate, restart; roll back on failure."""
     cur_nodes = read_nodes()
     old_specs = collect_ufw_specs(cur_nodes, load_inbounds())
-    files = (INBOUNDS, FRAG_EXTRA, CONF)
+    files = (INBOUNDS, FRAG_EXTRA, CUSTOM_CONF, CONF) if is_custom_config_mode() else (INBOUNDS, FRAG_EXTRA, CONF)
     backup = {}
     for p in files:
         try:
@@ -1376,6 +1866,7 @@ def apply_inbounds(new: list):
     try:
         atomic_write(INBOUNDS, json.dumps(new, indent=2, ensure_ascii=False), 0o600)
         atomic_write(FRAG_EXTRA, render_extra(new))
+        _sync_custom_conf_listeners(cur_nodes, new)
         atomic_write(CONF, assemble_config())
         rc, out = validate_config()
         if rc != 0:
@@ -1401,7 +1892,7 @@ def apply_nodes(new_nodes: list):
     """Update install-time VLESS Reality nodes (nodes.tsv + listeners.reality.yaml + config.yaml), validate, restart."""
     cur_inbs = load_inbounds()
     old_specs = collect_ufw_specs(read_nodes(), cur_inbs)
-    files = (NODES_TSV, FRAG_REALITY, CONF)
+    files = (NODES_TSV, FRAG_REALITY, CUSTOM_CONF, CONF) if is_custom_config_mode() else (NODES_TSV, FRAG_REALITY, CONF)
     backup = {}
     for p in files:
         try:
@@ -1412,6 +1903,7 @@ def apply_nodes(new_nodes: list):
     try:
         atomic_write(NODES_TSV, render_nodes_tsv(new_nodes), 0o640)
         atomic_write(FRAG_REALITY, render_reality(new_nodes), 0o640)
+        _sync_custom_conf_listeners(new_nodes, cur_inbs)
         atomic_write(CONF, assemble_config(), 0o640)
         rc, out = validate_config()
         if rc != 0:
@@ -1435,7 +1927,7 @@ def apply_nodes(new_nodes: list):
 
 def apply_server_proxies(new_proxies: list):
     """Write server outbound proxies (proxies.json + proxies.extra.yaml + config.yaml), validate, restart."""
-    files = (PROXIES_JSON, FRAG_PROXIES, CONF)
+    files = (PROXIES_JSON, FRAG_PROXIES, CUSTOM_CONF, CONF) if is_custom_config_mode() else (PROXIES_JSON, FRAG_PROXIES, CONF)
     backup = {}
     for p in files:
         try:
@@ -1446,6 +1938,7 @@ def apply_server_proxies(new_proxies: list):
     try:
         atomic_write(PROXIES_JSON, json.dumps(new_proxies, indent=2, ensure_ascii=False), 0o600)
         atomic_write(FRAG_PROXIES, dump_yaml_proxies(new_proxies), 0o640)
+        _sync_custom_conf_proxies(new_proxies)
         atomic_write(CONF, assemble_config(), 0o640)
         rc, out = validate_config()
         if rc != 0:
@@ -1467,7 +1960,7 @@ def apply_server_proxies(new_proxies: list):
 
 def apply_proxy_providers(new_providers: dict):
     """Write server proxy-providers (providers.json + providers.extra.yaml + config.yaml), validate, restart."""
-    files = (PROVIDERS_JSON, FRAG_PROVIDERS, CONF)
+    files = (PROVIDERS_JSON, FRAG_PROVIDERS, CUSTOM_CONF, CONF) if is_custom_config_mode() else (PROVIDERS_JSON, FRAG_PROVIDERS, CONF)
     backup = {}
     for p in files:
         try:
@@ -1478,6 +1971,7 @@ def apply_proxy_providers(new_providers: dict):
     try:
         atomic_write(PROVIDERS_JSON, json.dumps(new_providers, indent=2, ensure_ascii=False), 0o600)
         atomic_write(FRAG_PROVIDERS, dump_yaml_providers(new_providers), 0o640)
+        _sync_custom_conf_providers(new_providers)
         atomic_write(CONF, assemble_config(), 0o640)
         rc, out = validate_config()
         if rc != 0:
@@ -1498,12 +1992,14 @@ def apply_proxy_providers(new_providers: dict):
 
 
 def apply_custom_config(raw_yaml: str):
-    """Validate and apply user-supplied full server config, updating custom_config.yaml and config.yaml."""
+    """Validate and apply user-supplied full server config, syncing listeners, outbounds, and client subscription."""
     s = (raw_yaml or "").strip()
     if not s:
         raise ValueError("请输入完整的 mihomo 服务端配置内容")
     s += "\n"
-    files = (CUSTOM_CONF, CONF)
+    was_custom = is_custom_config_mode()
+    old_specs = collect_ufw_specs(read_nodes(), load_inbounds())
+    files = (CUSTOM_CONF, CONF, NODES_TSV, INBOUNDS, PROXIES_JSON, PROVIDERS_JSON)
     backup = {}
     for p in files:
         try:
@@ -1512,12 +2008,22 @@ def apply_custom_config(raw_yaml: str):
         except FileNotFoundError:
             backup[p] = None
     try:
+        if not was_custom:
+            for p in (NODES_TSV, INBOUNDS, PROXIES_JSON, PROVIDERS_JSON):
+                if backup[p] is not None:
+                    atomic_write(p + ".tplbak", backup[p], 0o600)
         atomic_write(CUSTOM_CONF, s, 0o640)
         atomic_write(CONF, s, 0o640)
         rc, out = validate_config()
         if rc != 0:
             raise RuntimeError("配置校验失败（mihomo -t）：" + out[-800:])
         sync_env_from_custom_config(s)
+        env = read_env()
+        new_inbounds, new_proxies, new_providers = parse_custom_config_state(s, env)
+        atomic_write(NODES_TSV, "", 0o640)
+        atomic_write(INBOUNDS, json.dumps(new_inbounds, indent=2, ensure_ascii=False), 0o600)
+        atomic_write(PROXIES_JSON, json.dumps(new_proxies, indent=2, ensure_ascii=False), 0o600)
+        atomic_write(PROVIDERS_JSON, json.dumps(new_providers, indent=2, ensure_ascii=False), 0o600)
         rc, out = run([SYSTEMCTL, "restart", "mihomo"])
         if rc != 0:
             raise RuntimeError("重启失败：" + out[-800:])
@@ -1527,15 +2033,18 @@ def apply_custom_config(raw_yaml: str):
                 if os.path.exists(p):
                     os.remove(p)
             else:
-                atomic_write(p, data, 0o640)
+                atomic_write(p, data, 0o600 if p.endswith(".json") else 0o640)
         run([SYSTEMCTL, "restart", "mihomo"])
         raise
+    sync_client_files()
+    sync_ufw(old_specs, collect_ufw_specs([], new_inbounds))
     wait_mihomo_ports()
 
 
 def reset_to_template_config():
     """Exit custom config mode and re-assemble server config from standard template + fragments."""
-    files = (CUSTOM_CONF, CONF)
+    old_specs = collect_ufw_specs(read_nodes(), load_inbounds())
+    files = (CUSTOM_CONF, CONF, NODES_TSV, INBOUNDS, PROXIES_JSON, PROVIDERS_JSON)
     backup = {}
     for p in files:
         try:
@@ -1546,6 +2055,15 @@ def reset_to_template_config():
     try:
         if os.path.exists(CUSTOM_CONF):
             os.remove(CUSTOM_CONF)
+        for p in (NODES_TSV, INBOUNDS, PROXIES_JSON, PROVIDERS_JSON):
+            bak_p = p + ".tplbak"
+            if os.path.isfile(bak_p):
+                with open(bak_p) as f:
+                    atomic_write(p, f.read(), 0o600 if p.endswith(".json") else 0o640)
+        atomic_write(FRAG_REALITY, render_reality(read_nodes()), 0o640)
+        atomic_write(FRAG_EXTRA, render_extra(load_inbounds()), 0o640)
+        atomic_write(FRAG_PROXIES, dump_yaml_proxies(load_server_proxies()), 0o640)
+        atomic_write(FRAG_PROVIDERS, dump_yaml_providers(load_proxy_providers()), 0o640)
         env = read_env()
         atomic_write(FRAG_CONTROLLER, render_controller_fragment(env), 0o640)
         atomic_write(CONF, assemble_config(), 0o640)
@@ -1555,15 +2073,21 @@ def reset_to_template_config():
         rc, out = run([SYSTEMCTL, "restart", "mihomo"])
         if rc != 0:
             raise RuntimeError("重启失败：" + out[-800:])
+        for p in (NODES_TSV, INBOUNDS, PROXIES_JSON, PROVIDERS_JSON):
+            bak_p = p + ".tplbak"
+            if os.path.exists(bak_p):
+                os.remove(bak_p)
     except Exception:
         for p, data in backup.items():
             if data is None:
                 if os.path.exists(p):
                     os.remove(p)
             else:
-                atomic_write(p, data, 0o640)
+                atomic_write(p, data, 0o600 if p.endswith(".json") else 0o640)
         run([SYSTEMCTL, "restart", "mihomo"])
         raise
+    sync_client_files()
+    sync_ufw(old_specs, collect_ufw_specs(read_nodes(), load_inbounds()))
     wait_mihomo_ports()
 
 
@@ -1577,19 +2101,19 @@ def reality_client(n: dict, env: dict) -> dict:
 
 
 def render_subscription(env: dict) -> str:
-    """Full mihomo client config: install Reality nodes + panel inbounds, via client.yaml.tpl."""
+    """Full mihomo client config: install Reality nodes + panel/custom inbounds, via client.yaml.tpl."""
     proxies = [reality_client(n, env) for n in read_nodes()] + [i["client"] for i in load_inbounds()]
-    p_lines = "\n".join("    - " + json.dumps(p, ensure_ascii=False) for p in proxies)
-    n_lines = "\n".join("      - " + json.dumps(p["name"], ensure_ascii=False) for p in proxies)
+    p_lines = "\n".join("  - " + json.dumps(p, ensure_ascii=False) for p in proxies) if proxies else "  []"
+    n_lines = "\n".join("      - " + json.dumps(p["name"], ensure_ascii=False) for p in proxies) if proxies else '      - "DIRECT"'
     out = []
     tpl_path = resolve_template_path("resources/client.yaml.tpl")
     with open(tpl_path) as f:
         for line in f:
             key = line.rstrip("\n")
             if key == "@@PROXIES@@":
-                out.append(p_lines + "\n" if p_lines else "")
+                out.append(p_lines + "\n")
             elif key == "@@PROXY_NAMES@@":
-                out.append(n_lines + "\n" if n_lines else "")
+                out.append(n_lines + "\n")
             else:
                 out.append(line)
     return "".join(out)
@@ -1676,9 +2200,9 @@ padding:22px 24px;margin-bottom:20px}
 .pill.warn{background:var(--warn-bg);color:var(--warn)}.pill.tag{background:var(--primary-soft);color:var(--primary-h)}
 .pill.gray{background:#f1f5f9;color:#475569}
 .k-vless-reality,.k-vless{background:#ede9fe;color:#6d28d9}.k-shadowsocks{background:#fce7f3;color:#be185d}
-.k-hysteria2,.k-tuic{background:#e0f2fe;color:#0369a1}.k-snell,.k-mieru{background:#dcfce7;color:#15803d}
+.k-hysteria2,.k-hysteria2-realm,.k-tuic{background:#e0f2fe;color:#0369a1}.k-snell,.k-mieru{background:#dcfce7;color:#15803d}
 .k-trusttunnel,.k-anytls{background:#ffedd5;color:#c2410c}.k-vmess{background:#fef3c7;color:#b45309}
-.k-sudoku,.k-shadowquic{background:#e0e7ff;color:#3730a3}.k-http,.k-socks{background:#f1f5f9;color:#334155}
+.k-sudoku,.k-shadowquic{background:#e0e7ff;color:#3730a3}.k-http,.k-socks,.k-mixed{background:#f1f5f9;color:#334155}
 .btn{display:inline-flex;align-items:center;justify-content:center;gap:6px;border:1px solid var(--line-strong);background:#fff;
 color:var(--text);border-radius:9px;padding:8px 15px;font:inherit;font-weight:550;cursor:pointer;
 transition:background .15s,border-color .15s,box-shadow .15s;white-space:nowrap}
@@ -1737,6 +2261,20 @@ radial-gradient(900px 500px at 110% 110%,#ede9fe 0,transparent 60%),var(--bg)}
 .login h1{font-size:20px;margin:0;display:flex;align-items:center;gap:8px}.login p.sub{color:var(--muted);margin:0;font-size:13px}
 .login .field{margin-bottom:16px}.login .btn{width:100%;height:40px;margin-top:6px}
 .err{background:#fef2f2;border:1px solid #fecaca;color:#7f1d1d;border-radius:10px;padding:10px 12px;margin-bottom:16px}
+.modal-backdrop{position:fixed;inset:0;background:rgba(15,23,42,.55);backdrop-filter:blur(4px);z-index:100;
+display:none;align-items:center;justify-content:center;padding:18px}
+.modal-backdrop.open{display:flex}
+.modal-box{background:var(--card);border:1px solid var(--line);border-radius:var(--radius);
+box-shadow:0 20px 50px rgba(15,23,42,.25);width:100%;max-width:620px;max-height:90vh;display:flex;flex-direction:column;overflow:hidden}
+.modal-h{padding:16px 20px;border-bottom:1px solid var(--line);display:flex;align-items:center;justify-content:space-between;gap:12px}
+.modal-h h3{margin:0;font-size:15px;font-weight:700;word-break:break-all}
+.modal-b{padding:18px 20px;overflow-y:auto;display:flex;flex-direction:column;gap:16px}
+.modal-sec{display:flex;flex-direction:column;gap:8px}
+.modal-sec-h{display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap}
+.modal-sec-h label{margin:0;font-size:12.5px;color:#334155;font-weight:650}
+textarea.node-ed-single{background:#0f172a;color:#e2e8f0;border-color:#334155;min-height:76px;font-size:12px}
+textarea.node-ed-multi{background:#0f172a;color:#e2e8f0;border-color:#334155;min-height:190px;font-size:12px}
+.modal-f{padding:12px 20px;border-top:1px solid var(--line);background:var(--surface);display:flex;justify-content:flex-end;gap:10px;flex-wrap:wrap}
 @media (max-width:920px){.split-2{grid-template-columns:1fr}}
 @media (max-width:640px){.hide-sm{display:none}.stats{grid-template-columns:repeat(2,1fr);gap:10px}.stat .val{font-size:18px}
 main{padding:16px 12px 40px}.topbar .in{padding:10px 14px}.card{padding:16px}.item .acts{margin-left:0;width:100%}}
@@ -1769,12 +2307,23 @@ function loadFileToTextarea(inp,targetId){var f=inp.files&&inp.files[0];if(!f)re
 var r=new FileReader();r.onload=function(){var ta=document.getElementById(targetId);if(ta)ta.value=r.result||''};
 r.readAsText(f)}
 function loadProxyFile(inp){loadFileToTextarea(inp,'proxies-raw')}
+function openNodeModal(btn){
+var m=document.getElementById('node-modal-backdrop');if(!m)return;
+var t=document.getElementById('node-modal-title');
+var s=document.getElementById('modal-node-single');
+var y=document.getElementById('modal-node-multi');
+if(t)t.textContent='查看节点配置 · '+(btn.dataset.title||'');
+if(s)s.value=btn.dataset.single||'';
+if(y)y.value=btn.dataset.multi||'';
+m.classList.add('open');
+}
+function closeNodeModal(){
+var m=document.getElementById('node-modal-backdrop');if(m)m.classList.remove('open');
+}
 function autoFixCertPaths(){
 var ta=document.getElementById('custom-config-raw');if(!ta)return;
 var certPath='/etc/clashserve/certs/fullchain.pem';
 var keyPath='/etc/clashserve/certs/privkey.pem';
-var cport=ta.dataset.cport||'';
-var secret=ta.dataset.secret||'';
 var lines=ta.value.split(/\\r?\\n/);
 var inReality=false,realityIndent=0,inProviders=false,provIndent=0,changed=0;
 for(var i=0;i<lines.length;i++){
@@ -1788,10 +2337,6 @@ if(/^reality-config\\s*:/.test(stripped)){inReality=true;realityIndent=indent;co
 if(/^proxy-providers\\s*:/.test(stripped)){inProviders=true;provIndent=indent;continue}
 if(inProviders&&indent===provIndent+2&&/^default\\s*:\\s*(#.*)?$/.test(stripped)){
 lines[i]=line.slice(0,indent)+stripped.replace(/^default(\\s*:)/,'default-sub$1');changed++;continue}
-if(cport&&/^external-controller-tls\\s*:/.test(stripped)&&stripped.indexOf('随机端口')>=0){
-lines[i]=line.slice(0,indent)+'external-controller-tls: "0.0.0.0:'+cport+'"';changed++;continue}
-if(secret&&/^secret\\s*:/.test(stripped)&&stripped.indexOf('填充随机密码')>=0){
-lines[i]=line.slice(0,indent)+'secret: "'+secret+'"';changed++;continue}
 var mc=stripped.match(/^((?:-\\s+)?certificate\\s*:\\s*)([^#\\n]+?)(\\s*(?:#.*)?)$/);
 if(mc){
 var cv=mc[2].trim().replace(/^['"]|['"]$/g,'');
@@ -1807,13 +2352,36 @@ lines[i]=line.slice(0,indent)+mk[1]+keyPath+(mk[3]||'');continue}
 }}}
 }
 ta.value=lines.join('\\n');
-showFlash('已自动修正 '+changed+' 处证书路径/占位配置（统一指向 /etc/clashserve/certs/），请点击「更新面板」保存生效。',true);
+showFlash('已自动修正 '+changed+' 处证书路径（统一指向 /etc/clashserve/certs/），请点击「更新 mihomo 服务端配置」保存生效。',true);
 }
 function showFlash(msg,ok){var box=document.getElementById('flash-box');if(!box)return;
 var div=document.createElement('div');div.className='flash '+(ok?'ok':'bad');
 var b=document.createElement('b');b.textContent=ok?'✓':'!';
 var d=document.createElement('div');d.textContent=msg;
 div.appendChild(b);div.appendChild(d);box.innerHTML='';box.appendChild(div)}
+function postAjaxForm(url,body,attempt){
+var ctrl=window.AbortController?new AbortController():null;
+var timer=ctrl?setTimeout(function(){ctrl.abort()},120000):null;
+var opts={method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded','X-Requested-With':'fetch','Accept':'application/json'},body:body,credentials:'same-origin',cache:'no-store'};
+if(ctrl)opts.signal=ctrl.signal;
+return fetch(url,opts).then(function(r){
+if(timer)clearTimeout(timer);
+return r.text().then(function(txt){
+var j=null;
+try{j=JSON.parse(txt)}catch(e){j={ok:r.ok,msg:txt||('HTTP '+r.status)}}
+return {status:r.status,data:j};
+});
+}).catch(function(err){
+if(timer)clearTimeout(timer);
+if(err&&err.name==='AbortError'){
+throw new Error('请求超时（120s），服务端可能正在下载规则集或校验配置，请稍后刷新页面查看状态');
+}
+if((attempt||0)<1){
+return new Promise(function(resolve){setTimeout(resolve,350)}).then(function(){return postAjaxForm(url,body,(attempt||0)+1)});
+}
+throw new Error('网络连接中断或被重置（'+((err&&err.message)||err)+'），请重试或刷新页面');
+});
+}
 function bindAjaxForms(root){
 (root||document).querySelectorAll('form[data-ajax]').forEach(function(f){
 if(f._ajaxBound)return;f._ajaxBound=true;
@@ -1824,8 +2392,7 @@ var btn=f.querySelector('button[type=submit],button:not([type])');
 var origTxt=btn?btn.textContent:'';
 if(btn){btn.disabled=true;if(f.dataset.busy)btn.textContent=f.dataset.busy}
 var body=new URLSearchParams(new FormData(f)).toString();
-fetch(f.action,{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded','X-Requested-With':'fetch','Accept':'application/json'},body:body,credentials:'same-origin'})
-.then(function(r){return r.json().then(function(j){return {status:r.status,data:j}})})
+postAjaxForm(f.action,body,0)
 .then(function(res){
 var d=res.data||{};
 showFlash(d.msg||(d.ok?'操作成功':'操作失败'),!!d.ok);
@@ -1833,6 +2400,7 @@ if(d.stats_html){var sb=document.getElementById('stats-bar');if(sb)sb.outerHTML=
 if(d.inbounds_html){var ic=document.getElementById('inbounds-card');if(ic){ic.outerHTML=d.inbounds_html;bindAjaxForms(document.getElementById('inbounds-card'))}}
 if(d.proxies_html){var pc=document.getElementById('proxies-section');if(pc){pc.outerHTML=d.proxies_html;bindAjaxForms(document.getElementById('proxies-section'))}}
 if(d.providers_html){var pvc=document.getElementById('providers-section');if(pvc){pvc.outerHTML=d.providers_html;bindAjaxForms(document.getElementById('providers-section'))}}
+if(d.server_card_html){var sc=document.getElementById('server-config-card');if(sc){sc.outerHTML=d.server_card_html;bindAjaxForms(document.getElementById('server-config-card'))}}
 if(d.custom_cfg_html){var cc=document.getElementById('custom-config-section');if(cc){cc.outerHTML=d.custom_cfg_html;bindAjaxForms(document.getElementById('custom-config-section'))}}
 if(d.zb_url){var zbu=document.getElementById('zb-url');if(zbu)zbu.textContent=d.zb_url;var zbo=document.getElementById('zb-open-btn');if(zbo)zbo.href=d.zb_url}
 if(d.ok){
@@ -1844,7 +2412,7 @@ var ta=f.querySelector('textarea[name=proxies_raw]');if(ta)ta.value='';
 var fi=f.querySelector('input[type=file]');if(fi)fi.value='';
 }
 })
-.catch(function(err){showFlash('请求失败：'+err,false)})
+.catch(function(err){showFlash('请求失败：'+((err&&err.message)||err),false)})
 .finally(function(){if(btn){btn.disabled=false;btn.textContent=origTxt}});
 });
 });
@@ -1853,6 +2421,7 @@ document.addEventListener('DOMContentLoaded',function(){var k=document.getElemen
 if(k){k.addEventListener('change',syncKind);syncKind()}
 try{var saved=sessionStorage.getItem('cs_tab');if(saved&&document.getElementById('tab-'+saved))switchTab(saved)}catch(e){}
 bindAjaxForms(document);
+document.addEventListener('keydown',function(ev){if(ev.key==='Escape')closeNodeModal()});
 document.querySelectorAll('form[data-busy]:not([data-ajax])').forEach(function(f){f.addEventListener('submit',function(){
 var b=f.querySelector('button[type=submit],button:not([type])');if(b){b.disabled=true;b.textContent=f.dataset.busy}})})});
 """
@@ -1875,6 +2444,8 @@ KIND_ZH = {
     "sudoku": "Sudoku（数独矩阵混淆）",
     "http": "HTTP（标准代理）",
     "socks": "SOCKS5（标准代理）",
+    "hysteria2-realm": "Hysteria2 Realm",
+    "mixed": "Mixed（HTTP + SOCKS5）",
 }
 
 
@@ -1959,16 +2530,20 @@ class Panel(BaseHTTPRequestHandler):
 
     def send(self, code, body, ctype="text/html; charset=utf-8", headers=None):
         data = body.encode() if isinstance(body, str) else body
-        self.send_response(code)
-        self.send_header("Content-Type", ctype)
-        self.send_header("Content-Length", str(len(data)))
-        self.send_header("X-Frame-Options", "DENY")
-        self.send_header("X-Content-Type-Options", "nosniff")
-        self.send_header("Cache-Control", "no-store")
-        for k, v in (headers or {}).items():
-            self.send_header(k, v)
-        self.end_headers()
-        self.wfile.write(data)
+        try:
+            self.send_response(code)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Connection", "close")
+            self.send_header("X-Frame-Options", "DENY")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("Cache-Control", "no-store")
+            for k, v in (headers or {}).items():
+                self.send_header(k, v)
+            self.end_headers()
+            self.wfile.write(data)
+        except (BrokenPipeError, ConnectionError, ssl.SSLError, socket.timeout):
+            pass
 
     def redirect(self, to, cookie=None):
         h = {"Location": to}
@@ -1992,6 +2567,7 @@ class Panel(BaseHTTPRequestHandler):
             "inbounds_html": self.render_inbounds_section(s, env, st),
             "proxies_html": self.render_proxies_section(s),
             "providers_html": self.render_providers_section(s),
+            "server_card_html": self.render_server_config_card(s, env, st),
             "custom_cfg_html": self.render_custom_config_section(s, env),
         }
         return self.send(200 if ok else 400, json.dumps(payload, ensure_ascii=False), "application/json; charset=utf-8")
@@ -2013,9 +2589,17 @@ class Panel(BaseHTTPRequestHandler):
 
     def form(self):
         n = int(self.headers.get("Content-Length") or 0)
-        if n > 1048576:
-            raise ValueError("请求体过大")
-        raw = self.rfile.read(n).decode()
+        if n > 8 * 1024 * 1024:
+            raise ValueError("请求体过大（超过 8MB 限制）")
+        chunks = []
+        rem = n
+        while rem > 0:
+            chunk = self.rfile.read(min(rem, 65536))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            rem -= len(chunk)
+        raw = b"".join(chunks).decode("utf-8", errors="replace")
         return {k: v[0] for k, v in parse_qs(raw, keep_blank_values=True).items()}
 
     def check_csrf(self, s, form):
@@ -2054,8 +2638,10 @@ class Panel(BaseHTTPRequestHandler):
         path = urlparse(self.path).path
         try:
             form = self.form()
-        except ValueError:
-            return self.send(413, "请求体过大", "text/plain; charset=utf-8")
+        except ValueError as e:
+            if self.is_ajax():
+                return self.send(413, json.dumps({"ok": False, "msg": str(e)}), "application/json; charset=utf-8")
+            return self.send(413, str(e), "text/plain; charset=utf-8")
         if path == "/login":
             return self.do_login(form)
         tok, s = self.session()
@@ -2383,31 +2969,34 @@ placeholder="请输入面板密码" required autofocus></div>
             return ("<span class='pill ok'><span class='dot ok'></span>监听中</span>" if port in listening
                     else "<span class='pill bad'><span class='dot bad'></span>未监听</span>")
 
-        def client_block(cid, proxy):
-            snippet = e("- " + json.dumps(proxy, ensure_ascii=False))
-            return (f"<details><summary>查看客户端配置</summary><pre id={cid}>{snippet}</pre>"
-                    f"<button type=button class='btn sm' style=margin-top:8px onclick=\"copyText('{cid}',this)\">复制</button>"
-                    f"</details>")
+        def node_cfg_btn(title, proxy):
+            single_s = e("- " + json.dumps(proxy, ensure_ascii=False))
+            multi_s = e("\n".join(dump_yaml_map(proxy, indent=2, first_dash=True)))
+            return (f"<button type=button class='btn sm' data-title='{e(title)}' "
+                    f"data-single='{single_s}' data-multi='{multi_s}' "
+                    f"onclick=\"openNodeModal(this)\">查看节点配置</button>")
 
-        def item(name, kind, port, extra_meta, acts, cid, proxy):
+        def item(name, kind, port, extra_meta, del_act, proxy):
+            cfg_btn = node_cfg_btn(name, proxy)
             return (f"<div class=item><div class=top><div><div class=nm>{e(name)}</div>"
                     f"<div class=meta><span>端口 <b class=mono>{port}</b></span>{extra_meta}</div></div>"
                     f"<span class='pill k-{kind}'>{e(KIND_ZH.get(kind, kind))}</span>{state(port)}"
-                    f"<div class=acts>{acts}</div></div>{client_block(cid, proxy)}</div>")
+                    f"<div class=acts>{cfg_btn}{del_act}</div></div></div>")
 
         rows = []
-        for idx, n in enumerate(nodes):
+        for n in nodes:
             acts = (f"<form class=inline method=post action=/nodes/{quote(n['name'])}/delete data-ajax=1 data-busy=正在删除…>{hid}"
                     f"<button class='btn sm danger' onclick=\"return confirm('确定删除入站「{e(n['name'])}」？删除后客户端将无法连接。')\">删除</button></form>")
             rows.append(item(n["name"], "vless-reality", n["port"], "<span>安装时生成</span>",
-                             acts, f"r-{idx}", reality_client(n, env)))
+                             acts, reality_client(n, env)))
         for i in inbs:
             created = time.strftime("%Y-%m-%d %H:%M", time.localtime(i.get("created", 0))) if i.get("created") else ""
+            src_label = "自定义配置同步" if is_custom_config_mode() else "面板添加"
             acts = (f"<form class=inline method=post action=/inbounds/{i['id']}/delete data-ajax=1 data-busy=正在删除…>{hid}"
                     f"<button class='btn sm danger' onclick=\"return confirm('确定删除入站「{e(i['name'])}」？删除后客户端将无法连接。')\">删除</button></form>")
             rows.append(item(i["name"], i["kind"], i["port"],
-                             f"<span>面板添加{(' · ' + created) if created else ''}</span>",
-                             acts, f"c-{i['id']}", i["client"]))
+                             f"<span>{src_label}{(' · ' + created) if created else ''}</span>",
+                             acts, i["client"]))
         all_proxies = [reality_client(n, env) for n in nodes] + [i["client"] for i in inbs]
         all_yaml = e("proxies:\n" + "\n".join("  - " + json.dumps(p, ensure_ascii=False) for p in all_proxies))
         copy_all = (f"<div class=spacer></div><pre id=all-proxies style=display:none>{all_yaml}</pre>"
@@ -2415,7 +3004,7 @@ placeholder="请输入面板密码" required autofocus></div>
                     if all_proxies else "")
         body_rows = "".join(rows) or "<div class=empty>暂无入站节点，可在右侧表单添加。</div>"
         return f"""<div class=card id=inbounds-card><div class=card-h><h2>入站节点（Listeners）</h2><span class='pill gray'>共 {len(rows)} 个</span>{copy_all}
-<div class=desc>展开「查看客户端配置」可复制单个节点配置，或点击右上角复制全部节点的 proxies 片段。所有节点变更实时同步到客户端订阅。</div></div>
+<div class=desc>点击「查看节点配置」可在弹窗中编辑并复制一行（简单）或多行（易读）mihomo 节点配置，或点击右上角复制全部节点的 proxies 片段。所有节点变更实时同步到客户端订阅。</div></div>
 <div class=list>{body_rows}</div></div>"""
 
     def render_providers_section(self, s: dict) -> str:
@@ -2462,9 +3051,9 @@ placeholder="请输入面板密码" required autofocus></div>
         hid = f"<input type=hidden name=csrf value='{e(s['csrf'])}'>"
         srv_proxies = load_server_proxies()
         p_rows = []
-        for idx, p in enumerate(srv_proxies):
-            yml = e(dump_yaml_proxies([p]).rstrip("\n"))
-            pid = f"sp-{idx}"
+        for p in srv_proxies:
+            single_s = e("- " + json.dumps(p, ensure_ascii=False))
+            multi_s = e("\n".join(dump_yaml_map(p, indent=2, first_dash=True)))
             if p.get("server") and p.get("port"):
                 endpoint_meta = f"<span>服务器 <b class=mono>{e(str(p['server']))}:{p['port']}</b></span>"
             elif p.get("server"):
@@ -2475,6 +3064,9 @@ placeholder="请输入面板密码" required autofocus></div>
                 endpoint_meta = f"<span>主机名 <b class=mono>{e(str(p['hostname']))}</b></span>"
             else:
                 endpoint_meta = f"<span>类型 <b class=mono>{e(str(p.get('type', '')))}</b></span>"
+            cfg_btn = (f"<button type=button class='btn sm' data-title='{e(p['name'])}' "
+                       f"data-single='{single_s}' data-multi='{multi_s}' "
+                       f"onclick=\"openNodeModal(this)\">查看节点配置</button>")
             del_form = (f"<form class=inline method=post action=/proxies/delete data-ajax=1 data-busy=正在删除…>{hid}"
                         f"<input type=hidden name=name value='{e(p['name'])}'>"
                         f"<button class='btn sm danger' onclick=\"return confirm('确定从服务端 proxies: 删除节点「{e(p['name'])}」？')\">删除</button></form>")
@@ -2483,15 +3075,13 @@ placeholder="请输入面板密码" required autofocus></div>
                 f"<div class=meta>{endpoint_meta}"
                 f"<span>UDP <b class=mono>{'开启' if p.get('udp', True) else '关闭'}</b></span></div></div>"
                 f"<span class='pill tag'>{e(str(p['type']))}</span>"
-                f"<div class=acts>{del_form}</div></div>"
-                f"<details><summary>查看多行 YAML</summary><pre id={pid}>{yml}</pre>"
-                f"<button type=button class='btn sm' style=margin-top:8px onclick=\"copyText('{pid}',this)\">复制</button></details></div>"
+                f"<div class=acts>{cfg_btn}{del_form}</div></div></div>"
             )
         list_html = f"<div class=list style='margin-bottom:14px'>{''.join(p_rows)}</div>" if p_rows else ""
         return f"""<div class=card id=proxies-section>
 <div class=card-h><h2>服务端手工出站节点（<code>proxies:</code>）</h2>
 <span class='pill gray'>已添加 {len(srv_proxies)} 个</span>
-<div class=desc>支持粘贴单行 JSON / YAML Flow 或多行 YAML 格式的 mihomo 节点配置（包含 <code>easytier</code>、<code>tailscale</code>、<code>vless</code>、<code>ss</code> 等任意协议及连字符/点号字段），自动转换为多行 YAML 追加到服务端 <code>proxies:</code> 下并默认开启 <code>udp: true</code>。</div></div>
+<div class=desc>支持粘贴单行 JSON / YAML Flow 或多行 YAML 格式的 mihomo 节点配置（包含 <code>easytier</code>、<code>tailscale</code>、<code>vless</code>、<code>ss</code> 等任意协议及连字符/点号字段），自动转换为多行 YAML 追加到服务端 <code>proxies:</code> 下并默认开启 <code>udp: true</code>。点击「查看节点配置」可弹窗编辑并复制单行或多行格式。</div></div>
 {list_html}
 <form method=post action=/proxies/add data-ajax=1 data-busy=正在写入配置…>{hid}
 <div style='margin-bottom:10px'>
@@ -2501,6 +3091,33 @@ placeholder="请输入面板密码" required autofocus></div>
 <button class='btn primary' type=submit>添加到服务端 proxies</button>
 <label class='btn sm' style='margin:0;cursor:pointer'>选择节点配置文件<input type=file accept='.yaml,.yml,.json,.txt' style='display:none' onchange='loadProxyFile(this)'></label>
 </div></form></div>"""
+
+    def render_server_config_card(self, s: dict, env: dict = None, st: dict = None) -> str:
+        e = html.escape
+        if env is None:
+            env = read_env()
+        if st is None:
+            st = mihomo_status()
+        listening = set(st["listening"])
+        hid = f"<input type=hidden name=csrf value='{e(s['csrf'])}'>"
+        zb_full_url = zashboard_url(env)
+        srv_cfg_url = server_config_url(env, self.cfg)
+        cport = get_controller_port(env)
+        zb_state = ("<span class='pill ok'><span class='dot ok'></span>控制端口 :" + str(cport) + " 监听中</span>"
+                    if cport in listening else f"<span class='pill warn'>控制端口 :{cport} 未监听</span>")
+        reset_zb = (f"<form class=inline method=post action=/action/reset-secret data-busy=正在重置…>"
+                    f"{hid}<button class='btn sm' onclick=\"return confirm('确定重置 Zashboard API 密钥？重置后需使用新链接连接。')\">重置 API 密钥</button></form>")
+        return f"""<div class=card id=server-config-card><div class=card-h><h2>mihomo 服务端配置</h2>{zb_state}<div class=spacer></div>{reset_zb}
+<div class=desc>管理 Mihomo 服务端运行配置与 Zashboard 控制面板（随机高端口 <code>:{cport}</code>，API Secret 已全量 URL 编码并拼接到地址末尾，支持一键免填直连）。</div></div>
+<div style=margin-bottom:14px><label>Zashboard HTTPS 地址（已包含 API Secret 免填直连参数）</label>
+<div class=sub-box><div class='url mono' id=zb-url>{e(zb_full_url or '—')}</div>
+<a class='btn primary' id=zb-open-btn href='{e(zb_full_url or "#")}' target=_blank rel=noopener>打开地址</a>
+<button type=button class=btn onclick="copyText('zb-url',this)">复制地址</button></div></div>
+<div><label>当前运行中的服务端配置链接（需面板登录鉴权）</label>
+<div class=sub-box><div class='url mono' id=srv-cfg-url>{e(srv_cfg_url)}</div>
+<a class=btn href='/config/server.yaml' target=_blank rel=noopener>打开配置</a>
+<button type=button class=btn onclick="copyText('srv-cfg-url',this)">复制链接</button></div></div>
+</div>"""
 
     def render_custom_config_section(self, s: dict, env: dict = None) -> str:
         e = html.escape
@@ -2513,8 +3130,6 @@ placeholder="请输入面板密码" required autofocus></div>
                 cur_cfg = f.read()
         except FileNotFoundError:
             cur_cfg = assemble_config()
-        cport = get_controller_port(env)
-        secret = env.get("MIHOMO_SECRET", "")
         mode_badge = ("<span class='pill warn'>当前：自定义配置模式</span>" if custom_active
                       else "<span class='pill ok'>当前：标准模板模式</span>")
         reset_btn = (f"<form class=inline method=post action=/config/reset-template data-ajax=1 data-busy=正在恢复…>{hid}"
@@ -2522,19 +3137,19 @@ placeholder="请输入面板密码" required autofocus></div>
                      if custom_active else "")
         return f"""<div class=card id=custom-config-section>
 <div class=card-h><h2>自定义 mihomo 服务端配置模式</h2>{mode_badge}<div class=spacer></div>{reset_btn}
-<div class=desc>您可以直接粘贴或编辑整份自备的 mihomo 服务端配置文件（<code>config.yaml</code>），校验通过后立即应用并同步更新面板。</div></div>
+<div class=desc>您可以直接粘贴或编辑整份自备的 mihomo 服务端配置文件（<code>config.yaml</code>），校验通过后立即应用，并自动同步刷新入站 Listeners 列表与客户端订阅。</div></div>
 <div class=notice>
 <b>⚠️ 醒目提醒：Mihomo 证书目录与相对路径说明</b><br>
 1. 本系统已将 Mihomo 运行目录（<code>-d</code>）、配置文件与证书统一收纳在 <code>/etc/clashserve</code>，证书实际位于 <code>/etc/clashserve/certs/fullchain.pem</code> 与 <code>/etc/clashserve/certs/privkey.pem</code>（相对路径即 <code>certs/fullchain.pem</code> 与 <code>certs/privkey.pem</code>）。<br>
-2. 若您的自备配置中填写了其他证书路径或相对路径，请点击下方 <b>「自动修改证书路径」</b> 按钮一键修正为本机证书路径（不会误改 Reality 的 <code>private-key</code>，并会自动填充 <code>随机端口</code> / <code>填充随机密码</code> 占位符），随后点击 <b>「更新面板」</b> 校验并生效。
+2. 若您的自备配置中填写了其他证书路径或相对路径，请点击下方 <b>「自动修改证书路径」</b> 按钮一键修正为本机证书路径（不会误改 Reality 的 <code>private-key</code>），随后点击 <b>「更新 mihomo 服务端配置」</b> 校验并生效。
 </div>
-<form method=post action=/config/custom data-ajax=1 data-busy=正在校验并更新面板…>{hid}
+<form method=post action=/config/custom data-ajax=1 data-busy="正在校验并更新 mihomo 服务端配置…">{hid}
 <div style='margin-bottom:12px'>
-<textarea class=code-ed id=custom-config-raw name=custom_config_raw data-cport='{cport}' data-secret='{e(secret)}' placeholder="在此粘贴完整的 mihomo 服务端 YAML 配置…">{e(cur_cfg)}</textarea>
+<textarea class=code-ed id=custom-config-raw name=custom_config_raw placeholder="在此粘贴完整的 mihomo 服务端 YAML 配置…">{e(cur_cfg)}</textarea>
 </div>
 <div class=row>
 <button type=button class='btn warn' onclick="autoFixCertPaths()">自动修改证书路径</button>
-<button type=submit class='btn primary'>更新面板</button>
+<button type=submit class='btn primary'>更新 mihomo 服务端配置</button>
 <label class=btn style='margin:0;cursor:pointer'>从本地文件载入<input type=file accept='.yaml,.yml,.txt' style='display:none' onchange="loadFileToTextarea(this,'custom-config-raw')"></label>
 <button type=button class=btn onclick="copyText('custom-config-raw',this)">复制当前配置</button>
 </div></form></div>"""
@@ -2576,7 +3191,7 @@ placeholder="请输入面板密码" required autofocus></div>
         inbounds = self.render_inbounds_section(s, env, st)
 
         # --- Add Inbound Form (14 protocols aligned with MetaCubeX wiki)
-        opts = "".join(f"<option value={k}>{v}</option>" for k, v in KIND_ZH.items())
+        opts = "".join(f"<option value={k}>{KIND_ZH.get(k, k)}</option>" for k in TYPES)
         ss_opts = "".join(f"<option value={c}>{SS_CIPHER_LABELS.get(c, c)}</option>" for c in SS_CIPHERS)
         no_cert = "" if certs_present() else "<div class=notice>证书文件缺失，暂时无法添加需要 TLS 证书的入站协议（请在服务器执行 clashserver cert）。</div>"
         add = f"""<div class=card><div class=card-h><h2>添加入站监听器</h2><span class='pill tag'>支持 14 种协议</span>
@@ -2637,37 +3252,14 @@ placeholder="请输入面板密码" required autofocus></div>
         url = self.sub_url()
         if url:
             sub = f"""<div class=card><div class=card-h><h2>客户端订阅链接</h2><span class='pill tag'>mihomo.yaml</span>
-<div class=desc>包含全部入站节点（含完整 Fake-IP DNS、Sniffer 与分流规则组：🚀 节点选择 → 🤖 AI → 📱 社交媒体 → 🇨🇳 中国 → 🐟 漏网之鱼）。链接即凭证，泄露后执行 <code>clashserver reset-sub</code> 更换。</div></div>
+<div class=desc>包含全部入站节点（内置 ACL4SSR Fake-IP 客户端规则模板：🚀 节点选择、♻️ 自动选择、🌍 国外媒体、📲 电报信息、Ⓜ️ 微软服务、🍎 苹果服务、📢 谷歌FCM、🎯 全球直连、🛑 全球拦截、🍃 应用净化、🐟 漏网之鱼）。链接即凭证，泄露后执行 <code>clashserver reset-sub</code> 更换。</div></div>
 <div class=sub-box><div class='url mono' id=sub-url>{e(url)}</div>
 <a class=btn href='{e(url)}' target=_blank rel=noopener>预览订阅</a>
 <button type=button class='btn primary' onclick="copyText('sub-url',this)">复制订阅链接</button></div></div>"""
         else:
             sub = ""
 
-        # --- mihomo 服务端配置 card (Zashboard URL with Secret appended + 打开地址 before 复制地址)
-        zb_full_url = zashboard_url(env)
-        zb_secret = env.get("MIHOMO_SECRET", "")
-        srv_cfg_url = server_config_url(env, self.cfg)
-        cport = get_controller_port(env)
-        zb_state = ("<span class='pill ok'><span class='dot ok'></span>控制端口 :" + str(cport) + " 监听中</span>"
-                    if cport in listening else f"<span class='pill warn'>控制端口 :{cport} 未监听</span>")
-        reset_zb = (f"<form class=inline method=post action=/action/reset-secret data-busy=正在重置…>"
-                    f"{hid}<button class='btn sm' onclick=\"return confirm('确定重置 Zashboard API 密钥？重置后需使用新链接连接。')\">重置 API 密钥</button></form>")
-        server_card = f"""<div class=card><div class=card-h><h2>mihomo 服务端配置</h2>{zb_state}<div class=spacer></div>{reset_zb}
-<div class=desc>管理 Mihomo 服务端运行配置与 Zashboard 控制面板（随机高端口 <code>:{cport}</code>，API Secret 已自动拼接到地址末尾，支持一键免填直连）。</div></div>
-<div style=margin-bottom:14px><label>Zashboard HTTPS 地址（已包含 API Secret 免填直连参数）</label>
-<div class=sub-box><div class='url mono' id=zb-url>{e(zb_full_url or '—')}</div>
-<a class='btn primary' id=zb-open-btn href='{e(zb_full_url or "#")}' target=_blank rel=noopener>打开地址</a>
-<button type=button class=btn onclick="copyText('zb-url',this)">复制地址</button></div></div>
-<div style=margin-bottom:14px><label>当前运行中的服务端配置链接（需面板登录鉴权）</label>
-<div class=sub-box><div class='url mono' id=srv-cfg-url>{e(srv_cfg_url)}</div>
-<a class=btn href='/config/server.yaml' target=_blank rel=noopener>打开配置</a>
-<button type=button class=btn onclick="copyText('srv-cfg-url',this)">复制链接</button></div></div>
-<div><label>API 密钥（Secret，已拼入上方 Zashboard 地址）</label>
-<div class=sub-box><div class='url mono' id=zb-secret>{e(zb_secret or '—')}</div>
-<button type=button class=btn onclick="copyText('zb-secret',this)">复制密钥</button></div></div>
-</div>"""
-
+        server_card = self.render_server_config_card(s, env, st)
         providers_sec = self.render_providers_section(s)
         proxies_sec = self.render_proxies_section(s)
         custom_cfg_sec = self.render_custom_config_section(s, env)
@@ -2685,6 +3277,28 @@ placeholder="请输入面板密码" required autofocus></div>
         tab_outbounds = f"<div class=tab-pane id=tab-outbounds>{providers_sec}{proxies_sec}</div>"
         tab_server = f"<div class=tab-pane id=tab-server>{server_card}{custom_cfg_sec}</div>"
 
+        node_modal = """<div class=modal-backdrop id=node-modal-backdrop onclick="if(event.target===this)closeNodeModal()">
+<div class=modal-box role=dialog aria-modal=true aria-labelledby=node-modal-title>
+<div class=modal-h><h3 id=node-modal-title>查看节点配置</h3>
+<button type=button class='btn sm' onclick="closeNodeModal()">✕</button></div>
+<div class=modal-b>
+<div class=modal-sec>
+<div class=modal-sec-h><label for=modal-node-single>单行格式（简单 · 一行 mihomo 节点配置，可直接编辑）</label>
+<button type=button class='btn sm primary' onclick="copyText('modal-node-single',this)">复制一行（简单）</button></div>
+<textarea id=modal-node-single class='mono node-ed-single' spellcheck=false></textarea>
+</div>
+<div class=modal-sec>
+<div class=modal-sec-h><label for=modal-node-multi>多行格式（易读 · 多行 YAML 节点配置，可直接编辑）</label>
+<button type=button class='btn sm primary' onclick="copyText('modal-node-multi',this)">复制多行（易读）</button></div>
+<textarea id=modal-node-multi class='mono node-ed-multi' spellcheck=false></textarea>
+</div>
+</div>
+<div class=modal-f>
+<button type=button class=btn onclick="copyText('modal-node-single',this)">复制一行（简单）</button>
+<button type=button class=btn onclick="copyText('modal-node-multi',this)">复制多行（易读）</button>
+<button type=button class='btn primary' onclick="closeNodeModal()">关闭</button>
+</div></div></div>"""
+
         icon = "✓" if ok else "!"
         fl_inner = f"<div class='flash {'ok' if ok else 'bad'}'><b>{icon}</b><div>{e(msg)}</div></div>" if msg else ""
         fl = f"<div id=flash-box>{fl_inner}</div>"
@@ -2696,7 +3310,7 @@ placeholder="请输入面板密码" required autofocus></div>
 <form class=inline method=post action=/logout>{hid}<button class='btn sm ghost'>退出登录</button></form></div></div>"""
         foot = f"<footer>Clash Serve v{VERSION} · 统一目录 /etc/clashserve · Mihomo 服务端管理控制台</footer>"
         return page(f"控制台 · Clash Serve v{VERSION}",
-                    f"{top}<main>{fl}{hero}{stats}{nav}{tab_inbounds}{tab_outbounds}{tab_server}</main>{foot}",
+                    f"{top}<main>{fl}{hero}{stats}{nav}{tab_inbounds}{tab_outbounds}{tab_server}{node_modal}</main>{foot}",
                     scripts=True)
 
 
@@ -2733,12 +3347,13 @@ class TLSServer(ThreadingHTTPServer):
     def get_request(self):
         sock, addr = self.socket.accept()
         self._reload()
-        sock.settimeout(30)
+        sock.settimeout(120)
         return self.ctx.wrap_socket(sock, server_side=True, do_handshake_on_connect=False), addr
 
     def finish_request(self, request, client_address):
         try:
             request.do_handshake()
+            request.settimeout(180)
         except (ssl.SSLError, OSError):
             return   # plain HTTP / scanners / aborted handshakes: drop quietly
         super().finish_request(request, client_address)

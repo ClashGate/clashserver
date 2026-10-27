@@ -14,7 +14,7 @@ if [[ -n ${CS_BOOTSTRAP_TMP:-} ]]; then trap 'rm -rf "$CS_BOOTSTRAP_TMP"' EXIT; 
 
 usage() {
   cat <<'EOF'
-clashserver —— Mihomo 代理服务端管理命令 (v0.5)
+clashserver —— Mihomo 代理服务端管理命令 (v0.55)
 
 用法：clashserver [子命令]
   （不带参数）       打开中文交互菜单
@@ -162,8 +162,6 @@ print_summary() {
     [[ -n $PANEL_PASS ]] && printf '  密码：%s（仅显示一次；可用 clashserver passwd 修改）\n' "$PANEL_PASS"
     printf '  证书方式：%s\n' "$(cert_mode_label)"
     printf '  证书：%s\n' "$(tls_label)"
-    printf '\n\033[1mmihomo 服务端配置（Zashboard）\033[0m\n'
-    printf '  地址（含密钥直连）：%s\n  控制端口：%s（随机空闲高端口）\n  API 密钥（Secret）：%s\n' "$(zashboard_url)" "$CONTROLLER_PORT" "$MIHOMO_SECRET"
     if [[ ${CERT_MODE:-port} != manual ]] && cert_is_temp; then
       printf '  \033[1;33m证书尚未签发成功，当前为临时自签证书；检查配置后可执行 clashserver cert 立即重试\033[0m\n'
     fi
@@ -266,6 +264,7 @@ update_self() {
   save_env
   assemble_config
   if validate_conf; then rm -f "$CONF.bak"; else mv -f "$CONF.bak" "$CONF"; warn "新模板生成的配置未通过校验，已保留原配置"; fi
+  render_client >/dev/null 2>&1 || true
   info "clashserver 已更新到 GitHub main 最新版"
 }
 

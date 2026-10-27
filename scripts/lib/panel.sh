@@ -24,11 +24,25 @@ panel_url() {
   if [[ $p == 443 ]]; then printf 'https://%s' "$h"; else printf 'https://%s:%s' "$h" "$p"; fi
 }
 
+urlencode() {
+  local s=${1:-} i c hex out=""
+  local LC_ALL=C
+  for ((i = 0; i < ${#s}; i++)); do
+    c=${s:i:1}
+    case "$c" in
+      [a-zA-Z0-9.~_-]) out+="$c" ;;
+      *) printf -v hex '%%%02X' "'$c"; out+="$hex" ;;
+    esac
+  done
+  printf '%s' "$out"
+}
+
 zashboard_url() {
   local h p
   h=$(panel_host); p=$(controller_port)
   if [[ -n ${MIHOMO_SECRET:-} ]]; then
-    printf 'https://%s:%s/ui/#/setup?hostname=%s&port=%s&secret=%s&https=true' "$h" "$p" "$h" "$p" "$MIHOMO_SECRET"
+    printf 'https://%s:%s/ui/#/setup?hostname=%s&port=%s&secret=%s&https=true' \
+      "$h" "$p" "$(urlencode "$h")" "$p" "$(urlencode "$MIHOMO_SECRET")"
   else
     printf 'https://%s:%s/ui/' "$h" "$p"
   fi

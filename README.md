@@ -17,17 +17,17 @@
 
 ## ✨ 特性
 
-- **傻瓜式一键**：一条 `curl | bash` 命令，中文交互，直接回车即可完成安装；默认值覆盖常见场景，无需记参数。
+- **简单模式**：一条 `curl | bash` 命令，中文交互，直接回车即可完成安装；默认值覆盖常见场景，无需记参数。
 - **三种模式**：
   - **无证书模式**（默认）：VLESS Reality 节点（默认入站名 `VlessReality`），不需要域名，安装后直接输出带完整 Fake-IP DNS 与分流规则的客户端配置。
   - **自动证书模式**：自动申请并续期 Let's Encrypt 证书（支持**端口模式**与 **DNS API 模式**），Mihomo 节点与 HTTPS 管理面板共用同一张证书，提供订阅链接，无需额外的 Web 服务器。
   - **手动证书模式**：使用用户自备的域名证书（放入 `/etc/clashserve/certs/` 目录并自动校验有效性），提供 HTTPS 管理面板和订阅链接。
 - **统一目录收纳（`/etc/clashserve`）**：Mihomo 内核、服务端配置、TLS 证书、管理面板、客户端配置备份全部统一收纳在 `/etc/clashserve/` 下，并自动迁移兼容旧版 `/etc/mihomo`、`/etc/clashserver`、`/var/lib/mihomo`、`/root/clashserver-client` 路径。
-- **管理控制台（v0.5 全新重做）**：采用分栏标签页与全览双模式信息架构：
-  - **14 种入站监听器（Listeners）**：对齐 MetaCubeX 官方 Wiki，支持添加与删除 VLESS Reality、Shadowsocks (`aes-128-gcm` / `aes-256-gcm`)、Hysteria2、Snell、TrustTunnel、VLESS（TLS / XHTTP / WS / gRPC / `mlkem768x25519plus` 原生加密）、VMess、AnyTLS、TUIC v5、ShadowQUIC、Mieru、Sudoku、HTTP、SOCKS5 入站（默认开启 `udp: true`）。
-  - **服务端出站与外部订阅（`proxies:` & `proxy-providers:`）**：支持一键导入外部订阅链接写入 `proxy-providers:`（含 `gstatic 204` 健康检查），支持粘贴单行 JSON / Flow 或多行 YAML 节点（含 `easytier`、`tailscale` 等扩展协议）追加到服务端 `proxies:`。
-  - **mihomo 服务端配置 & 自定义配置模式**：Zashboard 控制面板同样采用安装时分配的**随机空闲高端口**，并将 API Secret 直接拼接到 Zashboard HTTPS 地址末尾，提供「打开地址」与「复制地址」按钮；支持粘贴整份自备服务端配置、一键「自动修改证书路径」与「更新面板」。
-- **订阅链接**：`https://域名:端口/sub/<随机串>/mihomo.yaml`，内置适配自 MetaCubeX 官方推荐的 Fake-IP 客户端模板（策略组顺序：`🚀 节点选择` → `🤖 AI` → `📱 社交媒体` → `🇨🇳 中国` → `🐟 漏网之鱼`），带随机凭证，可随时更换。
+- **管理控制台（v0.55）**：采用分栏标签页与全览双模式信息架构：
+  - **14 种入站监听器（Listeners）**：对齐 MetaCubeX 官方 Wiki，支持添加与删除 VLESS Reality、Shadowsocks (`aes-128-gcm` / `aes-256-gcm`)、Hysteria2、Snell、TrustTunnel、VLESS（TLS / XHTTP / WS / gRPC / `mlkem768x25519plus` 原生加密）、VMess、AnyTLS、TUIC v5、ShadowQUIC、Mieru、Sudoku、HTTP、SOCKS5 入站（默认开启 `udp: true`），支持点击「查看节点配置」弹窗编辑并复制单行（简单）或多行（易读）mihomo 节点格式。
+  - **服务端出站与外部订阅（`proxies:` & `proxy-providers:`）**：支持一键导入外部订阅链接写入 `proxy-providers:`（含 `gstatic 204` 健康检查），支持粘贴单行 JSON / Flow 或多行 YAML 节点（含 `easytier`、`tailscale` 等扩展协议）追加到服务端 `proxies:`，并提供「查看节点配置」弹窗编辑与单行/多行复制。
+  - **mihomo 服务端配置 & 自定义配置模式**：Zashboard 控制面板同样采用安装时分配的**随机空闲高端口**，并将全量 URL 编码后的 API Secret 直接拼接到 Zashboard HTTPS 地址末尾，提供「打开地址」与「复制地址」按钮；支持粘贴整份自备服务端配置、一键「自动修改证书路径」与「更新 mihomo 服务端配置」，应用后自动同步刷新入站 Listeners 列表与客户端订阅。
+- **订阅链接**：`https://域名:端口/sub/<随机串>/mihomo.yaml`，内置基于 ACL4SSR 规则的完整 Fake-IP 客户端模板（包含 `🚀 节点选择`、`♻️ 自动选择`、`🌍 国外媒体`、`📲 电报信息`、`Ⓜ️ 微软服务`、`🍎 苹果服务`、`📢 谷歌FCM`、`🎯 全球直连`、`🛑 全球拦截`、`🍃 应用净化`、`🐟 漏网之鱼`），带随机凭证，可随时更换。
 - **`clashserver` 命令**：安装后直接输入 `clashserver` 打开中文管理菜单；常用操作都有短子命令。
 - **安全默认**：管理面板端口、Zashboard 控制端口、节点端口、UUID、密钥、密码全部随机生成；面板自身提供 HTTPS，登录失败次数限制；改配置前先 `mihomo -t` 校验，失败自动回滚。
 
@@ -62,7 +62,6 @@ curl -fsSL https://raw.githubusercontent.com/saulsburyroy/clashserver/main/insta
 ```text
 订阅链接：https://你的域名:<面板随机端口>/sub/<随机串>/mihomo.yaml   ← 导入 mihomo / Clash 客户端
 管理面板：https://你的域名:<面板随机端口>   用户名 admin   密码（仅显示一次）
-控制面板：https://你的域名:<控制随机端口>/ui/#/setup?hostname=...&port=...&secret=...&https=true
 ```
 
 之后随时运行：
@@ -100,7 +99,7 @@ clashserver
 
 - 面板地址 `https://你的域名:<随机端口>`（安装时自动分配随机空闲高端口），用户名 `admin`，密码安装时随机生成且**只显示一次**。修改：`clashserver passwd`；忘记：在服务器上执行 `clashserver reset-password`。
 - 证书模式默认开启 Mihomo `external-controller-tls`（安装时自动分配**随机空闲高端口**，持久化于 `CONTROLLER_PORT`）与 **Zashboard**（`external-ui`）。在面板「mihomo 服务端配置」卡片中，Zashboard HTTPS 地址已直接拼接 `hostname`/`port`/`secret` 参数，点击「打开地址」即可免填直连，点击「复制地址」即可复制含密钥的完整地址。
-- 支持在控制台启用**自定义 mihomo 服务端配置模式**：可粘贴整份自备服务端配置，点击「自动修改证书路径」将 TLS 证书与私钥一键修正为 `/etc/clashserve/certs/fullchain.pem` 与 `/etc/clashserve/certs/privkey.pem`（不会误改 Reality 的 `private-key`），点击「更新面板」即可通过 `mihomo -t` 校验并生效。
+- 支持在控制台启用**自定义 mihomo 服务端配置模式**：可粘贴整份自备服务端配置，点击「自动修改证书路径」将 TLS 证书与私钥一键修正为 `/etc/clashserve/certs/fullchain.pem` 与 `/etc/clashserve/certs/privkey.pem`（不会误改 Reality 的 `private-key`），点击「更新 mihomo 服务端配置」即可通过 `mihomo -t` 校验并生效，同时自动刷新入站 Listeners 列表与客户端订阅。
 - 证书由 [acme.sh](https://github.com/acmesh-official/acme.sh) 申请（可选**端口模式**或 **DNS API 模式**），存放在 `/etc/clashserve/certs/`，每小时检查、到期前自动续期。
 - 订阅链接内容包含全部入站节点，每次请求实时生成，并自动同步更新 `/etc/clashserve/client/` 本地客户端文件与本机 `ufw` 防火墙规则。
 
