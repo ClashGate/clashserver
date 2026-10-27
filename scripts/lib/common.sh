@@ -1,7 +1,7 @@
 # shellcheck shell=bash
 # clashserver 公共函数：常量、日志、交互、环境持久化、下载与安装文件、旧目录迁移
 
-CS_VERSION=0.6
+CS_VERSION=0.7
 REPO_TARBALL=https://github.com/saulsburyroy/clashserver/archive/refs/heads/main.tar.gz
 CS_ROOT=/etc/clashserve
 SELF_BIN=/usr/local/bin/clashserver
@@ -270,7 +270,7 @@ install_files() { # 把源码树 $CS_HOME 安装到统一目录 /etc/clashserve�
   local stage=$CS_ROOT/.stage.$$ d
   rm -rf "$stage"; install -d -m 755 "$stage"
   for d in install.sh uninstall.sh panel resources scripts; do cp -r "$CS_HOME/$d" "$stage/"; done
-  rm -rf "$stage/panel/__pycache__"
+  rm -rf "$stage/panel/__pycache__" "$stage/panel/web/node_modules"
   chmod 755 "$stage/install.sh" "$stage/uninstall.sh" "$stage/scripts/cmd/clashserver.sh" "$stage/scripts/certctl.sh" "$stage/panel/panel.py"
   for d in install.sh uninstall.sh panel resources scripts; do
     rm -rf "$CS_ROOT/$d.old"

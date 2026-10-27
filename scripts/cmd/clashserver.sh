@@ -14,7 +14,7 @@ if [[ -n ${CS_BOOTSTRAP_TMP:-} ]]; then trap 'rm -rf "$CS_BOOTSTRAP_TMP"' EXIT; 
 
 usage() {
   cat <<'EOF'
-clashserver —— Mihomo 代理服务端管理命令 (v0.6)
+clashserver —— Mihomo 代理服务端管理命令 (v0.7)
 
 用法：clashserver [子命令]
   （不带参数）       打开中文交互菜单
@@ -198,7 +198,6 @@ do_install() {
   if [[ $MODE == auto-cert ]]; then
     TOTAL=$([[ ${CERT_MODE:-port} == manual ]] && echo 10 || echo 11)
   fi
-  [[ -n $VPS_NAME ]] || VPS_NAME=$(hostname)
   install_deps
   [[ $MODE == auto-cert ]] && preflight_cert
   detect_ip
@@ -334,7 +333,6 @@ do_info() {
   migrate_legacy_paths
   [[ -f $STATE ]] || die "尚未安装"
   load_env
-  [[ -n $VPS_NAME ]] || VPS_NAME=$(hostname)
   detect_ip
   echo "proxies:"
   while IFS=$'\t' read -r name port uuid priv pub sid sni dec enc; do

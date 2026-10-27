@@ -12,5 +12,6 @@ client-config/
 .vscode/
 
 
-# python
+# python & frontend build deps
 __pycache__/
+node_modules/

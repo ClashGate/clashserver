@@ -21,8 +21,9 @@
   - **无证书模式**（默认）：无需域名，直接部署 VLESS Reality 节点并生成完整客户端配置。
   - **自动证书模式**：自动申请并续期 Let's Encrypt 证书（支持 **端口模式** 与 **DNS API 模式**），提供 HTTPS 管理面板与订阅链接。
   - **手动证书模式**：使用 `/etc/clashserve/certs/` 下的自备证书，校验通过后开启 HTTPS 管理面板与订阅链接。
-- **Web 管理控制台（v0.6）**：
-  - **14 种入站协议**：VLESS Reality、Shadowsocks、Hysteria2、Snell、TrustTunnel、VLESS、VMess、AnyTLS、TUIC v5、ShadowQUIC、Mieru、Sudoku、HTTP、SOCKS5，支持弹窗查看/编辑单行或多行节点配置。
+- **Web 管理控制台（v0.7，Vue 3 + Tailwind CSS）**：
+  - **12 种入站协议**：VLESS Reality、Shadowsocks、Hysteria2、Snell V5、AnyTLS、TUIC v5、TrustTunnel、ShadowQUIC、Mieru、Sudoku、HTTP、SOCKS5；节点名称默认按协议自动匹配，并提供**「复制配置」**（单行）与**「复制易读配置」**（多行 YAML）一键复制。
+  - **一键更换订阅链接**：面板内置**「更换订阅链接」**按钮（等效 `clashserver reset-sub`），旧链接立即失效。
   - **出站与外部订阅**：支持导入外部订阅为 `proxy-providers:`，或粘贴 JSON / YAML 节点（含 `easytier`、`tailscale`）追加到服务端 `proxies:`。
   - **服务端与自定义配置**：内置 Zashboard 免填直连地址（随机高端口 + URL 编码 Secret）；支持粘贴整份自定义服务端配置、一键修正证书路径并同步入站与客户端订阅。
 - **默认安全策略**：

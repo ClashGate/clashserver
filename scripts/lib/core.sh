@@ -256,7 +256,7 @@ proxy_line() { # name port uuid pub sid sni [enc]
   local enc_part=""
   [[ -n ${7:-} ]] && enc_part=$(printf ',"encryption":"%s"' "$7")
   printf '{"name":"%s|Clash|Reality","type":"vless","server":"%s","port":%s,"uuid":"%s","tls":true,"flow":"xtls-rprx-vision","client-fingerprint":"safari","skip-cert-verify":false%s,"reality-opts":{"public-key":"%s","short-id":"%s"},"network":"tcp","udp":true,"servername":"%s"}' \
-    "$VPS_NAME-$1" "$SERVER_IP" "$2" "$3" "$enc_part" "$4" "$5" "$6"
+    "$1" "$SERVER_IP" "$2" "$3" "$enc_part" "$4" "$5" "$6"
 }
 
 render_client() {
@@ -266,7 +266,7 @@ render_client() {
     [[ -n $name ]] || continue
     line=$(proxy_line "$name" "$port" "$uuid" "$pub" "$sid" "$sni" "${enc:-}")
     proxies+="  - $line"$'\n'
-    names+="      - \"$VPS_NAME-$name|Clash|Reality\""$'\n'
+    names+="      - \"$name|Clash|Reality\""$'\n'
   done < "$STATE"
   if [[ -f $CS_ETC/inbounds.json ]]; then
     while IFS=$'\t' read -r line cname; do
