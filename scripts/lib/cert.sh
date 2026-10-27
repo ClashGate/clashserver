@@ -6,11 +6,13 @@ preflight_cert() {
   [[ -n $DOMAIN ]] || die "证书模式需要域名"
   DOMAIN=${DOMAIN,,}
   [[ -n ${PANEL_PORT:-} ]] || PANEL_PORT=$(rand_port)
+  [[ -n ${CONTROLLER_PORT:-} ]] || CONTROLLER_PORT=$(rand_port)
   [[ $PANEL_PORT =~ ^[0-9]+$ ]] && ((PANEL_PORT >= 1 && PANEL_PORT <= 65535)) || die "管理面板端口无效：$PANEL_PORT"
-  [[ $PANEL_PORT != "${CONTROLLER_PORT:-7896}" ]] || die "管理面板端口不能与 Mihomo 控制端口（${CONTROLLER_PORT:-7896}）相同"
+  [[ $CONTROLLER_PORT =~ ^[0-9]+$ ]] && ((CONTROLLER_PORT >= 1 && CONTROLLER_PORT <= 65535)) || die "Mihomo 控制端口无效：$CONTROLLER_PORT"
+  [[ $PANEL_PORT != "$CONTROLLER_PORT" ]] || die "管理面板端口不能与 Mihomo 控制端口（$CONTROLLER_PORT）相同"
   local busy
-  busy=$(ss -Hltnp "sport = :$PANEL_PORT or sport = :${CONTROLLER_PORT:-7896}" 2>/dev/null || true)
-  [[ -z $busy ]] || die "端口 $PANEL_PORT / ${CONTROLLER_PORT:-7896} 已被占用，请先停止占用程序：
+  busy=$(ss -Hltnp "sport = :$PANEL_PORT or sport = :$CONTROLLER_PORT" 2>/dev/null || true)
+  [[ -z $busy ]] || die "端口 $PANEL_PORT / $CONTROLLER_PORT 已被占用，请先停止占用程序：
 $busy"
   if [[ ${CERT_MODE:-port} == manual ]]; then
     [[ $DOMAIN =~ $WILDCARD_DOMAIN_RE ]] || die "域名格式不正确：$DOMAIN"
@@ -131,7 +133,7 @@ setup_manual_cert() {
   fi
 }
 
-install_acme() { # 证书申请工具 acme.sh（与常见一键脚本相同；固定版本，装到 /etc/clashserver/acme.sh，不改 root 的 crontab / profile）
+install_acme() { # 证书申请工具 acme.sh（固定版本，装到 /etc/clashserve/acme.sh，不改 root 的 crontab / profile）
   log "安装证书申请工具 acme.sh"
   [[ $TLS == internal ]] && { info "开发模式（自签证书），跳过"; return 0; }
   if [[ -x $ACME_HOME/acme.sh ]] && "$ACME_HOME/acme.sh" --home "$ACME_HOME" --version 2>/dev/null | grep -q "v$ACMESH_VERSION"; then
@@ -161,7 +163,7 @@ issue_cert() {
   if ((rc == 0)); then
     info "证书已就绪：$CONF_DIR/certs/（$(cert_issuer)，到期 $(cert_enddate)；Mihomo 与面板共用）"
   else
-    # 只显示关键信息：certctl 提示 + acme.sh 的错误行（完整输出：/etc/clashserver/cert-install.log）
+    # 只显示关键信息：certctl 提示 + acme.sh 的错误行（完整输出：/etc/clashserve/cert-install.log）
     printf '%s\n' "$out" | grep -iE '^certctl:|error|invalid|fail|timeout|refused|unauthorized|connection' | tail -n 8 >&2 || true
     "$LIB_DIR/scripts/certctl.sh" selfsign >/dev/null
     if [[ ${CERT_MODE:-port} == dns ]]; then

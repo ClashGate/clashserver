@@ -4,7 +4,7 @@
 
 <p align="center">
   Debian VPS 上的 Mihomo 代理服务端一键部署与管理工具<br />
-  <sub>一条命令装好节点，自带中文管理面板与订阅链接</sub>
+  <sub>一条命令装好节点，自带中文管理控制台与订阅链接</sub>
 </p>
 
 <p align="center">
@@ -19,13 +19,17 @@
 
 - **傻瓜式一键**：一条 `curl | bash` 命令，中文交互，直接回车即可完成安装；默认值覆盖常见场景，无需记参数。
 - **三种模式**：
-  - **无证书模式**（默认）：VLESS Reality 节点（默认入站名 `VlessReality`），不需要域名，安装后直接输出带基本分流规则的客户端配置。
+  - **无证书模式**（默认）：VLESS Reality 节点（默认入站名 `VlessReality`），不需要域名，安装后直接输出带完整 Fake-IP DNS 与分流规则的客户端配置。
   - **自动证书模式**：自动申请并续期 Let's Encrypt 证书（支持**端口模式**与 **DNS API 模式**），Mihomo 节点与 HTTPS 管理面板共用同一张证书，提供订阅链接，无需额外的 Web 服务器。
-  - **手动证书模式**：使用用户自备的域名证书（放入 `/etc/mihomo/certs/` 目录并自动校验有效性），提供 HTTPS 管理面板和订阅链接。
-- **管理面板（v0.4）**：中文 Web 面板，查看 Mihomo 状态、一键重启 / 重载，支持在「mihomo 服务端配置」卡片中查看当前运行中的服务端配置（需登录鉴权）、手工粘贴单行 JSON 或多行 YAML 节点追加到服务端 `proxies:`、一键直连 Zashboard 控制面板，局部无刷新添加或删除 VLESS Reality / Shadowsocks (`aes-128-gcm` / `aes-256-gcm`) / Hysteria2 / Snell / TrustTunnel 入站（默认开启 `udp: true`），支持复制订阅链接或全部节点配置。
-- **订阅链接**：`https://域名:端口/sub/<随机串>/mihomo.yaml`，带随机凭证，可随时更换。
+  - **手动证书模式**：使用用户自备的域名证书（放入 `/etc/clashserve/certs/` 目录并自动校验有效性），提供 HTTPS 管理面板和订阅链接。
+- **统一目录收纳（`/etc/clashserve`）**：Mihomo 内核、服务端配置、TLS 证书、管理面板、客户端配置备份全部统一收纳在 `/etc/clashserve/` 下，并自动迁移兼容旧版 `/etc/mihomo`、`/etc/clashserver`、`/var/lib/mihomo`、`/root/clashserver-client` 路径。
+- **管理控制台（v0.5 全新重做）**：采用分栏标签页与全览双模式信息架构：
+  - **14 种入站监听器（Listeners）**：对齐 MetaCubeX 官方 Wiki，支持添加与删除 VLESS Reality、Shadowsocks (`aes-128-gcm` / `aes-256-gcm`)、Hysteria2、Snell、TrustTunnel、VLESS（TLS / XHTTP / WS / gRPC / `mlkem768x25519plus` 原生加密）、VMess、AnyTLS、TUIC v5、ShadowQUIC、Mieru、Sudoku、HTTP、SOCKS5 入站（默认开启 `udp: true`）。
+  - **服务端出站与外部订阅（`proxies:` & `proxy-providers:`）**：支持一键导入外部订阅链接写入 `proxy-providers:`（含 `gstatic 204` 健康检查），支持粘贴单行 JSON / Flow 或多行 YAML 节点（含 `easytier`、`tailscale` 等扩展协议）追加到服务端 `proxies:`。
+  - **mihomo 服务端配置 & 自定义配置模式**：Zashboard 控制面板同样采用安装时分配的**随机空闲高端口**，并将 API Secret 直接拼接到 Zashboard HTTPS 地址末尾，提供「打开地址」与「复制地址」按钮；支持粘贴整份自备服务端配置、一键「自动修改证书路径」与「更新面板」。
+- **订阅链接**：`https://域名:端口/sub/<随机串>/mihomo.yaml`，内置适配自 MetaCubeX 官方推荐的 Fake-IP 客户端模板（策略组顺序：`🚀 节点选择` → `🤖 AI` → `📱 社交媒体` → `🇨🇳 中国` → `🐟 漏网之鱼`），带随机凭证，可随时更换。
 - **`clashserver` 命令**：安装后直接输入 `clashserver` 打开中文管理菜单；常用操作都有短子命令。
-- **安全默认**：端口、UUID、密钥、密码全部随机生成；面板自身提供 HTTPS（不经反代），登录失败次数限制；改配置前先 `mihomo -t` 校验，失败自动回滚。
+- **安全默认**：管理面板端口、Zashboard 控制端口、节点端口、UUID、密钥、密码全部随机生成；面板自身提供 HTTPS，登录失败次数限制；改配置前先 `mihomo -t` 校验，失败自动回滚。
 
 ## 📦 安装
 
@@ -37,28 +41,28 @@ curl -fsSL https://raw.githubusercontent.com/saulsburyroy/clashserver/main/insta
 
 按提示选择模式，**直接回车即为无证书模式**。
 
-已有域名，想要管理面板和订阅链接：可选择 **2) 自动证书模式** 或 **3) 手动证书模式**：
+已有域名，想要管理面板和订阅链接：可在顶层菜单选择 **2) 自动证书模式**（随后在证书方式中选择 **1) 端口模式** 或 **2) DNS API 模式**）或 **3) 手动证书模式**：
 
 - **端口模式**（自动证书默认）：申请 / 续期证书时临时占用 **80** 端口；需将域名 A 记录指向本机并放行 TCP 80（Cloudflare 请设为 **灰云 DNS only**）。
 - **DNS API 模式**（自动证书）：填写 Cloudflare API Token 自动完成域名验证，**无需开放 80 / 443 端口**，支持 `*.example.com` 泛域名。
-- **手动证书模式**：按提示将自备证书（`fullchain.pem` 与 `privkey.pem`）放入 `/etc/mihomo/certs/` 目录，检测证书有效性通过后自动完成部署。
-- 环境：Debian 12（推荐）、systemd、root，服务器可直连 GitHub。管理面板在安装时自动选取**随机空闲高端口**提供 HTTPS（无需占用 443，安装输出与面板中均会明确展示端口）。
+- **手动证书模式**：按提示将自备证书（`fullchain.pem` 与 `privkey.pem`）放入 `/etc/clashserve/certs/` 目录，检测证书有效性通过后自动完成部署。
+- 环境：Debian 12（推荐）、systemd、root，服务器可直连 GitHub。管理面板与 Zashboard 控制接口均在安装时自动选取**随机空闲高端口**提供 HTTPS（无需占用 443，安装输出与面板中均会明确展示端口）。
 
 ## 🚀 快速上手
 
 **无证书模式**：安装结束会打印 `proxies` 片段，并生成完整客户端配置：
 
-```
-/root/clashserver-client/mihomo-client.yaml   # 完整 mihomo 客户端配置
-/root/clashserver-client/proxies.yaml         # 仅节点片段
+```text
+/etc/clashserve/client/mihomo-client.yaml   # 完整 mihomo 客户端配置（兼容软链 /root/clashserver-client）
+/etc/clashserve/client/proxies.yaml         # 仅节点片段
 ```
 
-**自动证书模式**：安装结束会打印订阅链接和面板账号：
+**自动证书 / 手动证书模式**：安装结束会打印订阅链接和面板账号：
 
-```
-订阅链接：https://你的域名:<随机端口>/sub/<随机串>/mihomo.yaml   ← 导入 mihomo / Clash 客户端
-管理面板：https://你的域名:<随机端口>   用户名 admin   密码（仅显示一次）
-控制面板：https://你的域名:7896/ui/   （Zashboard，面板内支持一键带参免填打开与重置密钥）
+```text
+订阅链接：https://你的域名:<面板随机端口>/sub/<随机串>/mihomo.yaml   ← 导入 mihomo / Clash 客户端
+管理面板：https://你的域名:<面板随机端口>   用户名 admin   密码（仅显示一次）
+控制面板：https://你的域名:<控制随机端口>/ui/#/setup?hostname=...&port=...&secret=...&https=true
 ```
 
 之后随时运行：
@@ -92,14 +96,13 @@ clashserver
   help               显示帮助
 ```
 
-## 🖥️ 管理面板与订阅（自动证书模式）
+## 🖥️ 管理面板与订阅（证书模式）
 
 - 面板地址 `https://你的域名:<随机端口>`（安装时自动分配随机空闲高端口），用户名 `admin`，密码安装时随机生成且**只显示一次**。修改：`clashserver passwd`；忘记：在服务器上执行 `clashserver reset-password`。
-- 自动证书模式默认开启 Mihomo `external-controller-tls`（默认端口 **7896**）与 **Zashboard**（`external-ui`），管理面板内提供带 `hostname`/`port`/`secret` 参数的一键直连按钮及 API 密钥复制/重置功能（CLI 亦可执行 `clashserver reset-secret`），用于出站策略分流与连接管理。
-- 证书由 [acme.sh](https://github.com/acmesh-official/acme.sh) 申请（可选**端口模式**或 **DNS API 模式**），存放在 `/etc/mihomo/certs/`，每小时检查、到期前自动续期：面板自动换用新证书（不重启）；Mihomo 控制面板及用到证书的 Hysteria2 / TrustTunnel 节点会自动重启 Mihomo 加载。若安装时证书尚未签发成功，会先用临时证书启动，检查配置后执行 `clashserver cert`（或在面板点击「立即申请 / 续期证书」）即可。`clashserver status` 可查看证书到期时间和上次自动续期结果。
-- 订阅链接内容包含全部节点（含面板中新增的节点），每次请求实时生成。默认安装创建 1 个 VLESS Reality 入站节点，后续在面板增删节点会自动同步更新 `/root/clashserver-client/` 本地客户端文件，并在本机启用 `ufw` 时自动放行新节点端口、回收已删除节点端口（含 UDP）。
-- **链接即凭证**：没有正确的随机串一律返回 404。泄露后执行 `clashserver reset-sub` 更换，旧链接立即失效。
-- 支持添加 VLESS Reality、Shadowsocks（经典 AEAD `aes-128-gcm` 等）、Hysteria2、Snell、TrustTunnel 入站。Hysteria2 / Snell / TrustTunnel 目前只做配置写入，尚未做连通性验证；推荐使用 VLESS Reality 或 Shadowsocks。
+- 证书模式默认开启 Mihomo `external-controller-tls`（安装时自动分配**随机空闲高端口**，持久化于 `CONTROLLER_PORT`）与 **Zashboard**（`external-ui`）。在面板「mihomo 服务端配置」卡片中，Zashboard HTTPS 地址已直接拼接 `hostname`/`port`/`secret` 参数，点击「打开地址」即可免填直连，点击「复制地址」即可复制含密钥的完整地址。
+- 支持在控制台启用**自定义 mihomo 服务端配置模式**：可粘贴整份自备服务端配置，点击「自动修改证书路径」将 TLS 证书与私钥一键修正为 `/etc/clashserve/certs/fullchain.pem` 与 `/etc/clashserve/certs/privkey.pem`（不会误改 Reality 的 `private-key`），点击「更新面板」即可通过 `mihomo -t` 校验并生效。
+- 证书由 [acme.sh](https://github.com/acmesh-official/acme.sh) 申请（可选**端口模式**或 **DNS API 模式**），存放在 `/etc/clashserve/certs/`，每小时检查、到期前自动续期。
+- 订阅链接内容包含全部入站节点，每次请求实时生成，并自动同步更新 `/etc/clashserve/client/` 本地客户端文件与本机 `ufw` 防火墙规则。
 
 ## 🔄 更新
 
@@ -107,7 +110,7 @@ clashserver
 clashserver update
 ```
 
-更新不会改变节点、密钥、面板密码和订阅链接。
+更新不会改变节点、密钥、面板密码和订阅链接；若从旧版（0.4 及更早版本）升级，会自动将 `/etc/mihomo`、`/etc/clashserver`、`/var/lib/mihomo`、`/usr/local/lib/clashserver`、`/root/clashserver-client` 迁移合并至 `/etc/clashserve/` 并保留兼容软链。
 
 ## 🗑️ 卸载
 
@@ -115,63 +118,29 @@ clashserver update
 clashserver uninstall
 ```
 
-删除 Mihomo、acme.sh、systemd 服务、面板、证书、配置、客户端文件和 `clashserver` 命令。需要保留的客户端配置请提前备份。
+删除 `/etc/clashserve`（含 Mihomo、acme.sh、面板、证书、配置、客户端文件）、systemd 服务和 `clashserver` 命令。需要保留的客户端配置请提前备份。
 
-## ❓ 常见问题
-
-<details>
-<summary><b>证书申请失败 / 面板提示「尚未签发」</b></summary>
-
-安装时若证书尚未签发成功，会先用临时证书启动（浏览器会提示不安全），之后每小时自动重试。请按所选方式确认：
-
-- **端口模式**：
-  1. 域名 A 记录指向本机公网 IP；Cloudflare 设为 **灰云（DNS only）**；如有 AAAA（IPv6）记录，须指向本机 IPv6，否则请删除；
-  2. 云服务商防火墙 / 安全组放行 **TCP 80**，且 80 端口没有被 nginx、apache 等其他程序占用。
-- **DNS API 模式**：
-  1. Cloudflare API Token 具备该域名所在区域的 **DNS 编辑**权限。
-
-修好后执行 `clashserver cert`（或在面板点击「立即申请 / 续期证书」）立即重试；`clashserver log` 可查看自动续期日志，安装时的申请记录在 `/etc/clashserver/cert-install.log`。
-</details>
-
-<details>
-<summary><b>忘记面板密码</b></summary>
-
-在服务器上执行 `clashserver reset-password`，会生成新的随机密码并显示一次；想自定义密码用 `clashserver passwd`。
-</details>
-
-<details>
-<summary><b>订阅链接泄露了</b></summary>
-
-执行 `clashserver reset-sub`，旧链接立即失效，再把新链接导入客户端。
-</details>
-
-<details>
-<summary><b>安装提示 80 端口被占用</b></summary>
-
-**端口模式**申请证书时临时使用 80 端口。你可以改选 **DNS API 模式**（无需 80 端口），或先停止占用 80 的程序（如 `systemctl disable --now nginx`）再安装。
-</details>
-
-## 📂 目录结构
+## 📂 目录结构（统一收口于 `/etc/clashserve`）
 
 ```text
-install.sh               # 一键安装入口（curl|bash 时自动下载其余文件）
-uninstall.sh             # 卸载入口
-panel/panel.py           # 管理面板（Python 标准库，无第三方依赖）
-resources/               # 服务端 / 客户端配置模板
-scripts/
-  cmd/clashserver.sh     # clashserver 命令：菜单与子命令
-  lib/                   # 公共函数：common / core / cert / panel
-  init/                  # systemd unit
-  certctl.sh             # 证书申请 / 续期（acme.sh），部署给 Mihomo 与面板
+/etc/clashserve/
+  mihomo                   # Mihomo 内核二进制（软链至 /usr/local/bin/mihomo）
+  config.yaml              # Mihomo 服务端主配置（运行工作目录 -d /etc/clashserve）
+  custom_config.yaml       # 自定义服务端配置模式下的完整配置（启用时存在）
+  certs/                   # TLS 证书目录（fullchain.pem / privkey.pem，相对路径 certs/*）
+  client/                  # 本地客户端配置备份（mihomo-client.yaml / proxies.yaml）
+  acme.sh/                 # acme.sh 自动证书程序与账户目录
+  clashserver.env          # 安装环境与随机端口持久化配置
+  panel.json               # 管理面板配置与订阅 token
+  inbounds.json            # 面板添加的入站节点记录
+  proxies.json             # 面板添加的服务端出站节点记录
+  providers.json           # 面板导入的外部订阅源（proxy-providers）记录
+  panel/panel.py           # 管理面板（Python 标准库，无第三方依赖）
+  resources/               # 服务端 / 客户端配置模板
+  scripts/                 # CLI 脚本、公共库、certctl.sh 与 systemd unit
 ```
 
-安装后文件位于 `/usr/local/lib/clashserver/`，配置在 `/etc/mihomo/` 与 `/etc/clashserver/`，命令为 `/usr/local/bin/clashserver`。
-
-## 🗺️ 路线图
-
-1. ✅ 无证书模式：VLESS Reality 一键安装
-2. 🚧 自动证书模式：Let's Encrypt 证书 + HTTPS 面板 + 订阅链接
-3. ⏳ 流量统计、权限、Docker 等
+旧版路径（`/etc/mihomo`、`/etc/clashserver`、`/var/lib/mihomo`、`/usr/local/lib/clashserver`、`/root/clashserver-client`）在升级或启动时会自动迁移至 `/etc/clashserve/` 并建立兼容软链接。
 
 ## ⚠️ 特别声明
 

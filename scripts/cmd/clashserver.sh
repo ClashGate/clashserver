@@ -14,7 +14,7 @@ if [[ -n ${CS_BOOTSTRAP_TMP:-} ]]; then trap 'rm -rf "$CS_BOOTSTRAP_TMP"' EXIT; 
 
 usage() {
   cat <<'EOF'
-clashserver —— Mihomo 代理服务端管理命令 (v0.4)
+clashserver —— Mihomo 代理服务端管理命令 (v0.5)
 
 用法：clashserver [子命令]
   （不带参数）       打开中文交互菜单
@@ -62,14 +62,12 @@ interactive_setup() {
     printf '\n请选择证书方式：\n'
     printf '  1) 端口模式（默认）：申请/续期时临时占用 80 端口（需将域名解析到本机并放行 TCP 80）\n'
     printf '  2) DNS API 模式：使用 Cloudflare API Token 验证（无需占用 80/443 端口，支持 *.泛域名）\n'
-    printf '  3) 手动证书模式：自行将证书文件放入 %s/certs/ 目录\n' "$CONF_DIR"
     while :; do
-      c=$(ask '请输入 [1/2/3]（回车默认 1）：' 1)
+      c=$(ask '请输入 [1/2]（回车默认 1）：' 1)
       case $c in
         1) CERT_MODE=port; break ;;
         2) CERT_MODE=dns; break ;;
-        3) CERT_MODE=manual; break ;;
-        *) printf '请输入 1、2 或 3\n' ;;
+        *) printf '请输入 1 或 2\n' ;;
       esac
     done
   fi
@@ -100,12 +98,15 @@ interactive_setup() {
   fi
   ((menu)) || return 0   # 开发用隐藏参数 -d 启动时不再追问
   [[ -n $PANEL_PORT ]] || PANEL_PORT=$(rand_port)
+  [[ -n $CONTROLLER_PORT ]] || CONTROLLER_PORT=$(rand_port)
   printf '已分配管理面板随机空闲高端口：%s\n' "$PANEL_PORT"
+  printf '已分配 Zashboard 控制接口随机空闲高端口：%s\n' "$CONTROLLER_PORT"
   # 证书通知邮箱默认直接跳过，不再询问
   return 0
 }
 
 check_existing() {
+  migrate_legacy_paths
   [[ -f $STATE ]] || return 0
   if has_tty; then
     [[ $(ask '检测到已安装 clashserver，是否卸载后重新安装？节点和密钥都会重新生成 [y/N]：' n) == [yY]* ]] \
@@ -128,7 +129,7 @@ verify() {
     info "监听中：$name :$port"
   done < "$STATE"
   [[ $MODE == auto-cert ]] || return 0
-  ss -ltn | grep -q ":${CONTROLLER_PORT:-7896} " || die "Mihomo 控制接口未在端口 ${CONTROLLER_PORT:-7896} 监听"
+  ss -ltn | grep -q ":$CONTROLLER_PORT " || die "Mihomo 控制接口未在端口 $CONTROLLER_PORT 监听"
   info "Zashboard：$(zashboard_url) 正常"
   local i h p
   h=$(panel_host); p=$(panel_port)
@@ -147,7 +148,7 @@ print_summary() {
   if [[ $MODE == auto-cert ]]; then
     [[ ${CERT_MODE:-port} == port ]] && printf ' 80'
     [[ $PANEL_PORT == 80 && ${CERT_MODE:-port} == port ]] || printf ' %s' "$PANEL_PORT"
-    printf ' %s' "${CONTROLLER_PORT:-7896}"
+    printf ' %s' "$CONTROLLER_PORT"
   fi
   awk -F'\t' '{printf " %s", $2}' "$STATE"; printf '\n'
   if [[ $MODE == auto-cert ]]; then
@@ -162,11 +163,11 @@ print_summary() {
     printf '  证书方式：%s\n' "$(cert_mode_label)"
     printf '  证书：%s\n' "$(tls_label)"
     printf '\n\033[1mmihomo 服务端配置（Zashboard）\033[0m\n'
-    printf '  地址：%s\n  API 密钥（Secret）：%s\n' "$(zashboard_url)" "$MIHOMO_SECRET"
+    printf '  地址（含密钥直连）：%s\n  控制端口：%s（随机空闲高端口）\n  API 密钥（Secret）：%s\n' "$(zashboard_url)" "$CONTROLLER_PORT" "$MIHOMO_SECRET"
     if [[ ${CERT_MODE:-port} != manual ]] && cert_is_temp; then
       printf '  \033[1;33m证书尚未签发成功，当前为临时自签证书；检查配置后可执行 clashserver cert 立即重试\033[0m\n'
     fi
-    printf '\n本地客户端配置备份：%s\n' "$CLIENT_DIR"
+    printf '\n统一安装目录：%s（本地客户端备份：%s）\n' "$CS_ROOT" "$CLIENT_DIR"
   else
     printf '\n\033[1m客户端 proxies 片段\033[0m\n'
     cat "$CLIENT_DIR/proxies.yaml"
@@ -180,12 +181,16 @@ print_summary() {
 }
 
 # ------------------------------------------------------------ actions
+do_migrate() {
+  migrate_legacy_paths
+}
+
 do_install() {
   check_os
   if [[ $CS_HOME -ef $LIB_DIR ]]; then # 从已安装副本运行（clashserver install）：先复制出来，避免重装时删掉自己
     local tmp
     tmp=$(mktemp -d /tmp/clashserver.XXXXXX)
-    cp -r "$LIB_DIR"/. "$tmp"/
+    for d in install.sh uninstall.sh panel resources scripts; do cp -r "$LIB_DIR/$d" "$tmp/"; done
     CS_BOOTSTRAP_TMP=$tmp CS_DEFAULT_ACTION=install exec bash "$tmp/scripts/cmd/clashserver.sh" "${ORIG_ARGS[@]}"
   fi
   interactive_setup
@@ -239,7 +244,7 @@ update_self() {
   local tmp
   tmp=$(mktemp -d /tmp/clashserver.XXXXXX)
   fetch_repo "$tmp"
-  CS_HOME=$tmp install_files   # 整体替换 $LIB_DIR；正在运行的脚本已读入内存，不受影响
+  CS_HOME=$tmp install_files   # 替换 /etc/clashserve 下的代码子目录；保留配置与证书
   rm -rf "$tmp"
   install -m 644 "$LIB_DIR/scripts/init/mihomo.service" "$UNIT"
   if [[ $MODE == auto-cert ]]; then
@@ -290,6 +295,7 @@ do_status() {
   require_installed; load_env
   printf '\033[1m运行状态（Clash Serve v%s）\033[0m\n' "$CS_VERSION"
   printf '  安装模式：%s\n' "$(mode_label)"
+  printf '  统一目录：%s\n' "$CS_ROOT"
   printf '  Mihomo：%s  %s\n' "$(svc_state mihomo)" "$("$BIN" -v 2>/dev/null | head -n1 | awk '{print $3}')"
   if [[ $MODE == auto-cert ]]; then
     if [[ ${CERT_MODE:-port} == manual ]]; then
@@ -297,7 +303,7 @@ do_status() {
     else
       printf '  面板：%s（%s，端口 %s）    证书自动续期：%s\n' "$(svc_state clashserve)" "$(panel_url)" "$(panel_port)" "$(svc_state clashserver-cert.timer)"
     fi
-    printf '  Zashboard：%s（端口 %s，API 密钥：%s）\n' "$(zashboard_url)" "${CONTROLLER_PORT:-7896}" "${MIHOMO_SECRET:-—}"
+    printf '  Zashboard：%s（端口 %s，API 密钥：%s）\n' "$(zashboard_url)" "$(controller_port)" "${MIHOMO_SECRET:-—}"
     printf '  域名：%s（证书：%s）\n' "$DOMAIN" "$(tls_label)"
     if cert_is_temp; then
       printf '  证书：\033[1;31m尚未签发\033[0m（临时自签证书；可执行 clashserver cert 重试）\n'
@@ -324,6 +330,7 @@ do_status() {
 }
 
 do_info() {
+  migrate_legacy_paths
   [[ -f $STATE ]] || die "尚未安装"
   load_env
   [[ -n $VPS_NAME ]] || VPS_NAME=$(hostname)
@@ -342,7 +349,7 @@ do_info() {
   if [[ $MODE == auto-cert ]]; then
     SUB_TOKEN=$(panel_cfg_get sub_token)
     printf '管理面板：%s（端口 %s，用户名 admin）\n' "$(panel_url)" "$(panel_port)"
-    printf 'Zashboard：%s（端口 %s，API 密钥：%s）\n' "$(zashboard_url)" "${CONTROLLER_PORT:-7896}" "${MIHOMO_SECRET:-—}"
+    printf 'Zashboard：%s（端口 %s，API 密钥：%s）\n' "$(zashboard_url)" "$(controller_port)" "${MIHOMO_SECRET:-—}"
     [[ -n $SUB_TOKEN ]] && printf '订阅链接：%s\n' "$(sub_url)"
   fi
   return 0
@@ -454,24 +461,31 @@ do_uninstall() {
   systemctl disable --now clashserve clashserver-cert.timer clashserver-cert.service 2>/dev/null || true
   rm -f /etc/systemd/system/clashserve.service /etc/systemd/system/clashserver-cert.{service,timer}
   systemctl disable --now mihomo 2>/dev/null || true
-  rm -f "$UNIT" "$BIN" "$SELF_BIN" /usr/local/bin/lego /run/clashserver-cert.lock
+  rm -f "$UNIT" "$BIN" /usr/local/bin/mihomo "$SELF_BIN" /usr/local/bin/lego /run/clashserver-cert.lock
   systemctl daemon-reload
-  local cert_bak=""
+  local cert_bak="" acme_bak=""
   if [[ ${CS_IN_REINSTALL:-0} == 1 && -d $CONF_DIR/certs ]] && ! cert_is_temp; then
     cert_bak=$(mktemp -d)
     cp -a "$CONF_DIR/certs/." "$cert_bak/" 2>/dev/null || true
   fi
-  rm -rf "$CONF_DIR" "$CLIENT_DIR" /var/lib/mihomo "$LIB_DIR" "$LIB_DIR.new" "$LIB_DIR.old"
-  if [[ -n $cert_bak ]]; then
-    install -d -m 750 "$CONF_DIR/certs"
-    cp -a "$cert_bak/." "$CONF_DIR/certs/" 2>/dev/null || true
-    rm -rf "$cert_bak"
-  fi
   if [[ ${CS_IN_REINSTALL:-0} == 1 && -d $ACME_HOME ]]; then
     # 重装时保留 acme.sh 账户与已签发证书：同一域名直接复用，避免触发 Let's Encrypt 频率限制（同域名每周 5 张）
-    find "$CS_ETC" -mindepth 1 -maxdepth 1 ! -name "$(basename "$ACME_HOME")" -exec rm -rf {} +
-  else
-    rm -rf "$CS_ETC"
+    acme_bak=$(mktemp -d)
+    cp -a "$ACME_HOME/." "$acme_bak/" 2>/dev/null || true
+  fi
+  rm -rf "$CS_ROOT" /etc/mihomo /etc/clashserver /var/lib/mihomo /root/clashserver-client /usr/local/lib/clashserver
+  if [[ -n $cert_bak || -n $acme_bak ]]; then
+    install -d -m 775 "$CS_ROOT"
+    if [[ -n $cert_bak ]]; then
+      install -d -m 750 "$CONF_DIR/certs"
+      cp -a "$cert_bak/." "$CONF_DIR/certs/" 2>/dev/null || true
+      rm -rf "$cert_bak"
+    fi
+    if [[ -n $acme_bak ]]; then
+      install -d -m 700 "$ACME_HOME"
+      cp -a "$acme_bak/." "$ACME_HOME/" 2>/dev/null || true
+      rm -rf "$acme_bak"
+    fi
   fi
   if id mihomo >/dev/null 2>&1; then userdel -f mihomo 2>/dev/null || true; fi
   echo "已卸载：Mihomo、管理面板、证书（含 acme.sh）、配置和客户端文件。"
@@ -480,7 +494,7 @@ do_uninstall() {
 ACTION=""
 while (($#)); do
   case "$1" in
-    install|update|uninstall|info|status|sub|passwd|restart|log|menu|reset-password|reset-secret|reset-sub|cert) ACTION=$1 ;;
+    install|update|uninstall|info|status|sub|passwd|restart|log|menu|reset-password|reset-secret|reset-sub|cert|migrate) ACTION=$1 ;;
     core|self) [[ $ACTION == update ]] || die "未知参数：$1"; UPDATE_WHAT=$1 ;;
     help) usage; exit 0 ;;
     # 以下为开发/测试用隐藏参数，不写入用户文档
@@ -491,6 +505,7 @@ while (($#)); do
     --manual-cert) CERT_MODE=manual; CERT_MODE_SET=1; MODE=auto-cert; MODE_SET=1 ;;
     --cf-token) CF_TOKEN=${2:?缺少 Cloudflare API Token}; CERT_MODE=dns; CERT_MODE_SET=1; MODE=auto-cert; MODE_SET=1; shift ;;
     --panel-port) PANEL_PORT=${2:?缺少面板端口}; shift ;;
+    --controller-port) CONTROLLER_PORT=${2:?缺少控制端口}; shift ;;
     --staging|--tls-staging) TLS=staging ;;
     --production|--tls-production) TLS=production ;;
     --tls-internal) TLS=internal ;;
@@ -502,6 +517,7 @@ done
 
 # 无子命令：由 install.sh 调用 -> 安装；已安装时直接运行 clashserver -> 管理菜单；未安装 -> 安装
 if [[ -z $ACTION ]]; then
+  migrate_legacy_paths
   if [[ -n ${CS_DEFAULT_ACTION:-} ]]; then ACTION=$CS_DEFAULT_ACTION
   elif [[ -f $STATE ]]; then ACTION=menu
   else ACTION=install; fi

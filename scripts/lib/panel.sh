@@ -11,6 +11,13 @@ panel_port() {
   printf '%s' "$p"
 }
 
+controller_port() {
+  local p=${CONTROLLER_PORT:-}
+  [[ -n $p ]] || p=$(rand_port)
+  CONTROLLER_PORT=$p
+  printf '%s' "$p"
+}
+
 panel_url() {
   local h p
   h=$(panel_host); p=$(panel_port)
@@ -18,14 +25,21 @@ panel_url() {
 }
 
 zashboard_url() {
-  printf 'https://%s:%s/ui/' "$(panel_host)" "${CONTROLLER_PORT:-7896}"
+  local h p
+  h=$(panel_host); p=$(controller_port)
+  if [[ -n ${MIHOMO_SECRET:-} ]]; then
+    printf 'https://%s:%s/ui/#/setup?hostname=%s&port=%s&secret=%s&https=true' "$h" "$p" "$h" "$p" "$MIHOMO_SECRET"
+  else
+    printf 'https://%s:%s/ui/' "$h" "$p"
+  fi
 }
 
 setup_panel() {
   log "配置管理面板"
-  install -d -m 755 "$CS_ETC"
-  [[ -f $CS_ETC/inbounds.json ]] || { echo '[]' > "$CS_ETC/inbounds.json"; chmod 600 "$CS_ETC/inbounds.json"; }
-  [[ -f $CS_ETC/proxies.json ]]  || { echo '[]' > "$CS_ETC/proxies.json";  chmod 600 "$CS_ETC/proxies.json"; }
+  install -d -m 775 "$CS_ETC"
+  [[ -f $CS_ETC/inbounds.json ]]  || { echo '[]' > "$CS_ETC/inbounds.json";  chmod 600 "$CS_ETC/inbounds.json"; }
+  [[ -f $CS_ETC/proxies.json ]]   || { echo '[]' > "$CS_ETC/proxies.json";   chmod 600 "$CS_ETC/proxies.json"; }
+  [[ -f $CS_ETC/providers.json ]] || { echo '{}' > "$CS_ETC/providers.json"; chmod 600 "$CS_ETC/providers.json"; }
   set_panel_password
   install -m 644 "$LIB_DIR/scripts/init/clashserve.service" /etc/systemd/system/clashserve.service
   systemctl daemon-reload
@@ -47,7 +61,7 @@ sub_url() { printf '%s/sub/%s/mihomo.yaml' "$(panel_url)" "$SUB_TOKEN"; }
 
 write_panel_cfg() { # PANEL_HASH + SUB_TOKEN -> panel.json (0600, root only)
   local p; p=$(panel_port)
-  # 面板自己做 HTTPS（与 Mihomo 共用 /etc/mihomo/certs 证书），直接监听 0.0.0.0:$PANEL_PORT，不需要反代和 443
+  # 面板自己做 HTTPS（与 Mihomo 共用 /etc/clashserve/certs 证书），直接监听 0.0.0.0:$PANEL_PORT，不需要反代和 443
   jq -n --arg h "$PANEL_HASH" --arg t "$SUB_TOKEN" --argjson p "$p" \
     --arg c "$CONF_DIR/certs/fullchain.pem" --arg k "$CONF_DIR/certs/privkey.pem" \
     '{username:"admin", password_hash:$h, listen:"0.0.0.0", port:$p, tls_cert:$c, tls_key:$k, sub_token:$t}' > "$PANEL_CFG.new"

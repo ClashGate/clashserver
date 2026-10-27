@@ -5,4 +5,5 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
-ExecStart=/usr/local/lib/clashserver/scripts/certctl.sh renew
+ExecStartPre=/usr/local/bin/clashserver migrate
+ExecStart=/etc/clashserve/scripts/certctl.sh renew

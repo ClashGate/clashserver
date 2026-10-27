@@ -5,8 +5,10 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-# Runs as root so it can rewrite /etc/mihomo and call systemctl; serves HTTPS itself with the certificate in /etc/mihomo/certs.
-ExecStart=/usr/bin/python3 /usr/local/lib/clashserver/panel/panel.py serve --config /etc/clashserver/panel.json
+WorkingDirectory=/etc/clashserve
+# Runs as root so it can rewrite /etc/clashserve and call systemctl; serves HTTPS itself with the certificate in /etc/clashserve/certs.
+ExecStartPre=+/usr/local/bin/clashserver migrate
+ExecStart=/usr/bin/python3 /etc/clashserve/panel/panel.py serve --config /etc/clashserve/panel.json
 Restart=on-failure
 RestartSec=3
 PrivateTmp=true

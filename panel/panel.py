@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
-"""clashserve v0.4 - minimal admin panel for clashserver (certificate modes).
+"""clashserve v0.5 - rebuilt admin console for clashserver (certificate modes).
 
 Stdlib only (Debian python3). Serves HTTPS itself with the same certificate
-Mihomo uses (/etc/mihomo/certs); no reverse proxy.
-Features: admin login, Mihomo status dashboard, restart/reload, cert renewal,
-mihomo server config viewer (authenticated) & outbound proxies manager,
-add/delete inbounds (vless-reality, shadowsocks, hysteria2, snell, trusttunnel).
+Mihomo uses (/etc/clashserve/certs); no reverse proxy.
+Unified directory layout under /etc/clashserve with automatic migration from
+legacy /etc/mihomo, /etc/clashserver, /var/lib/mihomo, /root/clashserver-client.
 
 Subcommands:
   panel.py hash-password            read password on stdin, print hash
@@ -22,6 +21,7 @@ import os
 import random
 import re
 import secrets
+import shutil
 import socket
 import ssl
 import subprocess
@@ -33,34 +33,44 @@ import uuid as uuidlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse, quote
 
-VERSION = "0.4"
+VERSION = "0.5"
 
 # CLASHSERVER_ROOT lets the panel run against a fake tree for local testing.
 ROOT = os.environ.get("CLASHSERVER_ROOT", "")
-ENV_FILE = ROOT + "/etc/clashserver/clashserver.env"
-INBOUNDS = ROOT + "/etc/clashserver/inbounds.json"
-PROXIES_JSON = ROOT + "/etc/clashserver/proxies.json"
-MIHOMO_DIR = ROOT + "/etc/mihomo"
+CS_ROOT = ROOT + "/etc/clashserve"
+ENV_FILE = CS_ROOT + "/clashserver.env"
+INBOUNDS = CS_ROOT + "/inbounds.json"
+PROXIES_JSON = CS_ROOT + "/proxies.json"
+PROVIDERS_JSON = CS_ROOT + "/providers.json"
+MIHOMO_DIR = CS_ROOT
 CONF = MIHOMO_DIR + "/config.yaml"
+CUSTOM_CONF = MIHOMO_DIR + "/custom_config.yaml"
 NODES_TSV = MIHOMO_DIR + "/nodes.tsv"
 FRAG_CONTROLLER = MIHOMO_DIR + "/controller.yaml"
 FRAG_REALITY = MIHOMO_DIR + "/listeners.reality.yaml"
 FRAG_EXTRA = MIHOMO_DIR + "/listeners.extra.yaml"
 FRAG_PROXIES = MIHOMO_DIR + "/proxies.extra.yaml"
-TEMPLATE = ROOT + "/usr/local/lib/clashserver/resources/server.yaml.tpl"
-CLIENT_TEMPLATE = ROOT + "/usr/local/lib/clashserver/resources/client.yaml.tpl"
-CLIENT_DIR = ROOT + "/root/clashserver-client"
-CERTCTL = ROOT + "/usr/local/lib/clashserver/scripts/certctl.sh"
-CERT = "/etc/mihomo/certs/fullchain.pem"   # paths as seen by mihomo (not ROOT-prefixed)
-KEY = "/etc/mihomo/certs/privkey.pem"
-MIHOMO_BIN = os.environ.get("MIHOMO_BIN", "/usr/local/bin/mihomo")
+FRAG_PROVIDERS = MIHOMO_DIR + "/providers.extra.yaml"
+TEMPLATE = CS_ROOT + "/resources/server.yaml.tpl"
+CLIENT_TEMPLATE = CS_ROOT + "/resources/client.yaml.tpl"
+CLIENT_DIR = CS_ROOT + "/client"
+CERTCTL = CS_ROOT + "/scripts/certctl.sh"
+CERT = "/etc/clashserve/certs/fullchain.pem"   # paths as seen by mihomo (not ROOT-prefixed)
+KEY = "/etc/clashserve/certs/privkey.pem"
+CERT_REL = "certs/fullchain.pem"
+KEY_REL = "certs/privkey.pem"
+MIHOMO_BIN = os.environ.get("MIHOMO_BIN", CS_ROOT + "/mihomo" if os.path.isfile(CS_ROOT + "/mihomo") else "/usr/local/bin/mihomo")
 SYSTEMCTL = os.environ.get("SYSTEMCTL", "systemctl")
 UFW_BIN = os.environ.get("UFW_BIN", "ufw")
 REALITY_SNI = "www.sc.com"
 PBKDF2_ITER = 600_000
 SESSION_TTL = 12 * 3600
-TYPES = ("vless-reality", "shadowsocks", "hysteria2", "snell", "trusttunnel")
-CERT_TYPES = ("hysteria2", "trusttunnel")
+
+TYPES = (
+    "vless-reality", "shadowsocks", "hysteria2", "snell", "trusttunnel",
+    "vless", "vmess", "anytls", "tuic", "shadowquic", "mieru", "sudoku", "http", "socks",
+)
+CERT_TYPES = ("hysteria2", "trusttunnel", "anytls", "tuic")
 SS_CIPHERS = ("aes-128-gcm", "aes-256-gcm")
 SS_CIPHER_LABELS = {
     "aes-128-gcm": "aes-128-gcm（aes128，默认）",
@@ -70,12 +80,73 @@ STR_KEYS = {
     "name", "type", "server", "uuid", "password", "psk", "public-key", "private-key",
     "short-id", "servername", "sni", "cipher", "flow", "client-fingerprint",
     "username", "network", "path", "host", "mode", "plugin", "obfs", "fingerprint",
+    "network-name", "network-secret", "state-dir", "control-url", "auth-key", "hostname",
+    "key", "aead-method", "table-type", "congestion-controller", "udp-relay-mode",
+    "decryption", "encryption", "ws-path", "grpc-service-name", "transport",
 }
+
+ANYTLS_DEFAULT_PADDING = (
+    "stop=7\n"
+    "0=40-40\n"
+    "1=120-380\n"
+    "2=350-550,c,550-1100,c,600-1200,c,500-1000\n"
+    "3=12-12,450-950\n"
+    "4=480-1100\n"
+    "5=500-1200\n"
+    "6=450-1000"
+)
 
 LOCK = threading.Lock()
 
 
-# ---------------------------------------------------------------- helpers
+# ---------------------------------------------------------------- legacy migration & helpers
+def resolve_mihomo_bin() -> str:
+    env_bin = os.environ.get("MIHOMO_BIN")
+    if env_bin:
+        return env_bin
+    if os.path.isfile(CS_ROOT + "/mihomo") and os.access(CS_ROOT + "/mihomo", os.X_OK):
+        return CS_ROOT + "/mihomo"
+    return "/usr/local/bin/mihomo"
+
+
+def resolve_template_path(rel_path: str) -> str:
+    p1 = CS_ROOT + "/" + rel_path
+    if os.path.isfile(p1):
+        return p1
+    p2 = ROOT + "/usr/local/lib/clashserver/" + rel_path
+    if os.path.isfile(p2):
+        return p2
+    here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    p3 = os.path.join(here, rel_path)
+    return p3 if os.path.isfile(p3) else p1
+
+
+def ensure_unified_root():
+    """Migrate legacy scattered directories (/etc/mihomo, /etc/clashserver, etc.) into /etc/clashserve."""
+    os.makedirs(CS_ROOT, mode=0o775, exist_ok=True)
+    os.makedirs(CLIENT_DIR, mode=0o700, exist_ok=True)
+    for legacy in (ROOT + "/etc/clashserver", ROOT + "/etc/mihomo", ROOT + "/var/lib/mihomo", ROOT + "/usr/local/lib/clashserver"):
+        if os.path.isdir(legacy) and not os.path.islink(legacy):
+            for entry in os.listdir(legacy):
+                src = os.path.join(legacy, entry)
+                dst = os.path.join(CS_ROOT, entry)
+                if not os.path.exists(dst):
+                    try:
+                        shutil.move(src, dst)
+                    except Exception:
+                        pass
+    old_client = ROOT + "/root/clashserver-client"
+    if os.path.isdir(old_client) and not os.path.islink(old_client):
+        for entry in os.listdir(old_client):
+            src = os.path.join(old_client, entry)
+            dst = os.path.join(CLIENT_DIR, entry)
+            if not os.path.exists(dst):
+                try:
+                    shutil.move(src, dst)
+                except Exception:
+                    pass
+
+
 def hash_password(pw: str) -> str:
     salt = secrets.token_bytes(16)
     dk = hashlib.pbkdf2_hmac("sha256", pw.encode(), salt, PBKDF2_ITER)
@@ -95,14 +166,16 @@ def verify_password(pw: str, stored: str) -> bool:
 
 def read_env() -> dict:
     env = {}
-    try:
-        with open(ENV_FILE) as f:
-            for line in f:
-                m = re.match(r"^([A-Z_]+)=(.*)$", line.strip())
-                if m:
-                    env[m.group(1)] = m.group(2).strip("'\"")
-    except FileNotFoundError:
-        pass
+    for p in (ENV_FILE, ROOT + "/etc/clashserver/clashserver.env"):
+        try:
+            with open(p) as f:
+                for line in f:
+                    m = re.match(r"^([A-Z_]+)=(.*)$", line.strip())
+                    if m:
+                        env[m.group(1)] = m.group(2).strip("'\"")
+            break
+        except FileNotFoundError:
+            continue
     return env
 
 
@@ -110,7 +183,7 @@ def run(cmd, timeout=30, env=None):
     try:
         p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=env)
         return p.returncode, (p.stdout + p.stderr).strip()
-    except Exception as e:  # missing binary, timeout ...
+    except Exception as e:
         return 127, str(e)
 
 
@@ -140,6 +213,24 @@ def load_server_proxies() -> list:
     return []
 
 
+def load_proxy_providers() -> dict:
+    try:
+        with open(PROVIDERS_JSON) as f:
+            data = json.load(f)
+            if isinstance(data, dict):
+                return data
+    except FileNotFoundError:
+        pass
+    return {}
+
+
+def is_custom_config_mode() -> bool:
+    try:
+        return os.path.isfile(CUSTOM_CONF) and os.path.getsize(CUSTOM_CONF) > 0
+    except OSError:
+        return False
+
+
 def read_nodes() -> list:
     rows = []
     try:
@@ -154,8 +245,28 @@ def read_nodes() -> list:
     return rows
 
 
+def get_controller_port(env: dict = None) -> int:
+    if env is None:
+        env = read_env()
+    try:
+        p = int(env.get("CONTROLLER_PORT") or 0)
+        if 1 <= p <= 65535:
+            return p
+    except ValueError:
+        pass
+    try:
+        with open(CONF) as f:
+            txt = f.read()
+        m = re.search(r'external-controller-tls:\s*["\']?[^"\':\s]+:(\d+)', txt)
+        if m:
+            return int(m.group(1))
+    except Exception:
+        pass
+    return 7896
+
+
 def used_ports(env) -> set:
-    ports = {80, 443, int(env.get("PANEL_PORT", "0") or 0), int(env.get("CONTROLLER_PORT", "7896") or 7896)}
+    ports = {80, 443, int(env.get("PANEL_PORT", "0") or 0), get_controller_port(env)}
     ports |= {n["port"] for n in read_nodes()}
     ports |= {i["port"] for i in load_inbounds()}
     return ports
@@ -171,7 +282,7 @@ def pick_port(env) -> int:
 
 
 def reality_keypair():
-    rc, out = run([MIHOMO_BIN, "generate", "reality-keypair"])
+    rc, out = run([resolve_mihomo_bin(), "generate", "reality-keypair"])
     priv = re.search(r"PrivateKey:\s*(\S+)", out)
     pub = re.search(r"PublicKey:\s*(\S+)", out)
     if rc != 0 or not priv or not pub:
@@ -179,8 +290,30 @@ def reality_keypair():
     return priv.group(1), pub.group(1)
 
 
+def sudoku_keypair():
+    rc, out = run([resolve_mihomo_bin(), "generate", "sudoku-keypair"])
+    priv = re.search(r"PrivateKey:\s*(\S+)", out)
+    pub = re.search(r"PublicKey:\s*(\S+)", out)
+    if rc == 0 and priv and pub:
+        return priv.group(1), pub.group(1)
+    u = str(uuidlib.uuid4())
+    return u, u
+
+
+def vless_x25519_keypair():
+    rc, out = run([resolve_mihomo_bin(), "generate", "vless-x25519"])
+    dec = re.search(r'\[Server\]\s*decryption:\s*"([^"]+)"', out)
+    enc = re.search(r'\[Client\]\s*encryption:\s*"([^"]+)"', out)
+    if rc != 0 or not dec or not enc:
+        raise RuntimeError("VLESS 加密密钥生成失败：" + out)
+    return dec.group(1), enc.group(1)
+
+
 def certs_present() -> bool:
-    return os.path.isfile(ROOT + CERT) and os.path.isfile(ROOT + KEY)
+    for c, k in ((CERT, KEY), (ROOT + CERT, ROOT + KEY), (ROOT + "/etc/mihomo/certs/fullchain.pem", ROOT + "/etc/mihomo/certs/privkey.pem")):
+        if os.path.isfile(c) and os.path.isfile(k):
+            return True
+    return False
 
 
 def panel_base_url(env: dict, cfg: dict) -> str:
@@ -197,23 +330,20 @@ def server_config_url(env: dict, cfg: dict) -> str:
 
 
 def zashboard_url(env: dict) -> str:
+    """Return Zashboard HTTPS URL with API Secret appended for one-click copy & direct login."""
     host = env.get("DOMAIN", "").removeprefix("*.") or env.get("SERVER_IP", "")
     if not host:
         return ""
-    cport = int(env.get("CONTROLLER_PORT") or 7896)
-    return f"https://{host}:{cport}/ui/"
-
-
-def zashboard_connect_url(env: dict) -> str:
-    host = env.get("DOMAIN", "").removeprefix("*.") or env.get("SERVER_IP", "")
-    if not host:
-        return ""
-    cport = int(env.get("CONTROLLER_PORT") or 7896)
+    cport = get_controller_port(env)
     secret = env.get("MIHOMO_SECRET", "")
     if not secret:
         return f"https://{host}:{cport}/ui/"
     qs = f"hostname={quote(host)}&port={cport}&secret={quote(secret)}&https=true"
-    return f"https://{host}:{cport}/ui/?{qs}#/setup?{qs}"
+    return f"https://{host}:{cport}/ui/#/setup?{qs}"
+
+
+def zashboard_connect_url(env: dict) -> str:
+    return zashboard_url(env)
 
 
 def write_env_var(key: str, val: str):
@@ -237,7 +367,7 @@ def write_env_var(key: str, val: str):
 def render_controller_fragment(env: dict) -> str:
     if env.get("MODE") != "auto-cert":
         return "# controller disabled in no-cert mode\n"
-    cport = env.get("CONTROLLER_PORT") or "7896"
+    cport = get_controller_port(env)
     secret = env.get("MIHOMO_SECRET", "")
     return (
         f'external-controller-tls: "0.0.0.0:{cport}"\n'
@@ -283,7 +413,7 @@ def split_kv(line: str):
         elif ch == '"' and not in_sq:
             in_dq = not in_dq
         elif ch == ":" and not in_sq and not in_dq:
-            if i + 1 == len(line) or line[i + 1].isspace():
+            if i + 1 == len(line) or line[i + 1].isspace() or line[i + 1] in ('"', "'", "[", "{"):
                 k = line[:i].strip()
                 if (k.startswith('"') and k.endswith('"')) or (k.startswith("'") and k.endswith("'")):
                     k = k[1:-1]
@@ -367,6 +497,8 @@ def parse_flow_val(val: str, key: str = ""):
             return {}
         out = {}
         for item in split_flow(inner, ","):
+            if not item:
+                continue
             k, sep, v = split_kv(item)
             if not sep:
                 raise ValueError(f"无法解析字段：{item}")
@@ -382,7 +514,7 @@ def parse_flow_val(val: str, key: str = ""):
         inner = val[1:-1].strip()
         if not inner:
             return []
-        return [parse_flow_val(x, key) for x in split_flow(inner, ",")]
+        return [parse_flow_val(x, key) for x in split_flow(inner, ",") if x != ""]
     return parse_scalar(val, key)
 
 
@@ -452,21 +584,22 @@ def parse_yaml_lines(lines: list, idx: int = 0, min_indent: int = 0):
 
 
 def parse_mihomo_proxies(raw: str) -> list:
-    """Parse single-line JSON or multi-line YAML mihomo node configs; normalize with udp: True."""
+    """Parse single-line JSON/flow or multi-line YAML mihomo node configs; supports easytier/tailscale/etc."""
     s = (raw or "").strip()
     if not s:
         raise ValueError("请输入 mihomo 节点配置（单行 JSON 或多行 YAML）")
     if re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*://", s):
-        raise ValueError("不支持分享链接（如 vless://、ss://），请粘贴 mihomo 配置格式（JSON 或 YAML）")
+        raise ValueError("不支持分享链接（如 vless://、ss://），请粘贴 mihomo 配置格式（JSON 或 YAML；若是订阅链接请在上方「导入外部订阅」中添加）")
     parsed = None
     if (s.startswith("{") and s.endswith("}")) or (s.startswith("[") and s.endswith("]")):
         try:
             parsed = json.loads(s)
         except Exception:
-            try:
-                parsed = parse_flow_val(s)
-            except Exception:
-                parsed = None
+            if "\n" not in s or (s.startswith("[") and s.endswith("]")):
+                try:
+                    parsed = parse_flow_val(s)
+                except Exception:
+                    parsed = None
     if parsed is None:
         lines = []
         for raw_line in s.splitlines():
@@ -477,8 +610,19 @@ def parse_mihomo_proxies(raw: str) -> list:
             lines.append((ind, cleaned.strip()))
         if not lines:
             raise ValueError("节点配置为空")
-        if all(txt.startswith("{") and txt.endswith("}") for _, txt in lines):
-            parsed = [parse_flow_val(txt) for _, txt in lines]
+        flow_candidates = []
+        all_flow = True
+        for _, txt in lines:
+            t = txt[1:].strip() if (txt == "-" or txt.startswith("- ")) else txt
+            if t.endswith(","):
+                t = t[:-1].strip()
+            if t.startswith("{") and t.endswith("}"):
+                flow_candidates.append(t)
+            else:
+                all_flow = False
+                break
+        if all_flow and flow_candidates:
+            parsed = [parse_flow_val(t) for t in flow_candidates]
         else:
             parsed, end_idx = parse_yaml_lines(lines, 0, 0)
             if end_idx < len(lines):
@@ -496,22 +640,24 @@ def parse_mihomo_proxies(raw: str) -> list:
     out = []
     for item in items:
         if not isinstance(item, dict):
-            raise ValueError("每个节点必须是键值对对象（需包含 name、type、server、port）")
+            raise ValueError("每个节点必须是键值对对象（需包含 name 与 type）")
         node = dict(item)
-        for req in ("name", "type", "server", "port"):
+        for req in ("name", "type"):
             if req not in node or node[req] in ("", None):
                 raise ValueError(f"节点缺少必填字段：{req}")
         node["name"] = str(node["name"]).strip()
         node["type"] = str(node["type"]).strip()
-        node["server"] = str(node["server"]).strip()
-        try:
-            port = int(node["port"])
-            if not 1 <= port <= 65535:
-                raise ValueError()
-            node["port"] = port
-        except Exception:
-            nm, pt = node["name"], node["port"]
-            raise ValueError(f"节点「{nm}」端口无效：{pt}")
+        if "server" in node and node["server"] not in ("", None):
+            node["server"] = str(node["server"]).strip()
+        if "port" in node and node["port"] not in ("", None):
+            try:
+                port = int(node["port"])
+                if not 1 <= port <= 65535:
+                    raise ValueError()
+                node["port"] = port
+            except Exception:
+                nm, pt = node["name"], node["port"]
+                raise ValueError(f"节点「{nm}」端口无效：{pt}")
         for k in list(node.keys()):
             if k in STR_KEYS and node[k] is not None and not isinstance(node[k], (dict, list)):
                 node[k] = str(node[k])
@@ -577,12 +723,156 @@ def dump_yaml_proxies(proxies: list) -> str:
     return "\n".join(lines) + ("\n" if lines else "")
 
 
+def dump_yaml_providers(providers: dict) -> str:
+    """Render proxy-providers dict as 2-space indented YAML mapping entries."""
+    lines = []
+    for name, cfg in providers.items():
+        ks = name if re.fullmatch(r"[A-Za-z0-9._-]+", str(name)) else json.dumps(str(name), ensure_ascii=False)
+        lines.append(f"  {ks}:")
+        lines.extend(dump_yaml_map(cfg, indent=4, first_dash=False))
+    return "\n".join(lines) + ("\n" if lines else "")
+
+
+def build_proxy_provider(url: str, name: str = "", existing: dict = None) -> tuple:
+    """Build a proxy-provider entry matching the 0.5 requirement structure."""
+    u = (url or "").strip()
+    if not re.match(r"^https?://\S+$", u):
+        raise ValueError("请输入有效的 HTTP/HTTPS 订阅链接")
+    raw_name = (name or "").strip()
+    if not raw_name or raw_name.lower() == "default":
+        # Note: Mihomo kernel forbids naming a proxy-provider literally 'default'
+        # ("can not defined a provider called `default`"), while path ./default.yaml is valid.
+        prov_name = "default-sub" if (existing and "sub" in existing and "default-sub" not in existing) else "sub"
+        if raw_name.lower() == "default":
+            prov_name = "default-sub"
+        path = "./default.yaml" if not existing else f"./{prov_name}.yaml"
+    else:
+        if not re.fullmatch(r"[A-Za-z0-9._-]{1,48}", raw_name):
+            raise ValueError("订阅源名称仅限 1-48 位字母、数字及 . _ -")
+        prov_name = raw_name
+        path = f"./{prov_name}.yaml"
+    entry = {
+        "type": "http",
+        "url": u,
+        "path": path,
+        "interval": 3600,
+        "proxy": "DIRECT",
+        "health-check": {
+            "enable": True,
+            "url": "https://www.gstatic.com/generate_204",
+            "interval": 300,
+            "timeout": 5000,
+            "lazy": True,
+        },
+    }
+    return prov_name, entry
+
+
+# ---------------------------------------------------------------- custom server config helpers
+def rewrite_cert_paths_in_yaml(raw_yaml: str, env: dict = None) -> tuple:
+    """Automatically rewrite TLS certificate/private-key paths in user server config to /etc/clashserve/certs/*.
+    Never modifies private-key inside reality-config blocks. Also fills controller port/secret placeholders if present."""
+    if env is None:
+        env = read_env()
+    cport = get_controller_port(env)
+    secret = env.get("MIHOMO_SECRET", "")
+    lines = raw_yaml.splitlines()
+    out = []
+    in_reality = False
+    reality_indent = 0
+    in_providers = False
+    providers_indent = 0
+    changed = 0
+
+    for line in lines:
+        stripped = line.lstrip(" ")
+        indent = len(line) - len(stripped)
+        if stripped and not stripped.startswith("#"):
+            if in_reality and indent <= reality_indent:
+                in_reality = False
+            if in_providers and indent <= providers_indent:
+                in_providers = False
+            if re.match(r"^reality-config\s*:", stripped):
+                in_reality = True
+                reality_indent = indent
+                out.append(line)
+                continue
+            if re.match(r"^proxy-providers\s*:", stripped):
+                in_providers = True
+                providers_indent = indent
+                out.append(line)
+                continue
+            # Rename reserved provider key `default:` under `proxy-providers:` so mihomo -t passes
+            if in_providers and indent == providers_indent + 2 and re.match(r"^default\s*:\s*(#.*)?$", stripped):
+                line = (" " * indent) + re.sub(r"^default(\s*:)", r"default-sub\1", stripped, count=1)
+                changed += 1
+                out.append(line)
+                continue
+            # Replace placeholder external-controller-tls port if present
+            if re.match(r"^external-controller-tls\s*:", stripped) and "随机端口" in stripped:
+                line = (" " * indent) + f'external-controller-tls: "0.0.0.0:{cport}"'
+                changed += 1
+                out.append(line)
+                continue
+            # Replace placeholder secret if present
+            if secret and re.match(r"^secret\s*:", stripped) and "填充随机密码" in stripped:
+                line = (" " * indent) + f'secret: "{secret}"'
+                changed += 1
+                out.append(line)
+                continue
+            # Rewrite certificate:
+            m_cert = re.match(r"^((?:-\s+)?certificate\s*:\s*)([^#\n]+?)(\s*(?:#.*)?)$", stripped)
+            if m_cert:
+                cur_val = m_cert.group(2).strip().strip("'\"")
+                if cur_val != CERT:
+                    changed += 1
+                line = (" " * indent) + f"{m_cert.group(1)}{CERT}{m_cert.group(3)}"
+                out.append(line)
+                continue
+            # Rewrite private-key: (ONLY when not inside reality-config)
+            if not in_reality:
+                m_key = re.match(r"^((?:-\s+)?private-key\s*:\s*)([^#\n]+?)(\s*(?:#.*)?)$", stripped)
+                if m_key:
+                    cur_val = m_key.group(2).strip().strip("'\"")
+                    if "/" in cur_val or "." in cur_val or "key" in cur_val.lower() or "pem" in cur_val.lower():
+                        if cur_val != KEY:
+                            changed += 1
+                        line = (" " * indent) + f"{m_key.group(1)}{KEY}{m_key.group(3)}"
+                        out.append(line)
+                        continue
+        out.append(line)
+    res = "\n".join(out) + ("\n" if raw_yaml.endswith("\n") else "")
+    return res, changed
+
+
+def sync_env_from_custom_config(raw_yaml: str):
+    """Sync CONTROLLER_PORT and MIHOMO_SECRET from a custom server config if present."""
+    m_port = re.search(r'^\s*external-controller-tls\s*:\s*["\']?[^"\':\s]+:(\d+)["\']?', raw_yaml, re.M)
+    if m_port:
+        p = int(m_port.group(1))
+        if 1 <= p <= 65535:
+            write_env_var("CONTROLLER_PORT", str(p))
+    m_sec = re.search(r'^\s*secret\s*:\s*["\']?([^"\'#\r\n]+?)["\']?\s*(?:#.*)?$', raw_yaml, re.M)
+    if m_sec:
+        sec = m_sec.group(1).strip()
+        if sec and sec != "填充随机密码":
+            write_env_var("MIHOMO_SECRET", sec)
+
+
 # ---------------------------------------------------------------- inbound model
 def build_inbound(kind: str, form: dict, env: dict) -> dict:
     if kind not in TYPES:
         raise ValueError("未知的入站类型")
-    if kind in CERT_TYPES and not certs_present():
-        raise ValueError(f"{kind} 需要 TLS 证书，未找到 {CERT}（请先在服务器执行 clashserver cert）")
+    need_cert = kind in CERT_TYPES
+    if kind in ("http", "socks") and form.get(f"{kind}_tls") == "1":
+        need_cert = True
+    if kind == "vmess" and form.get("vmess_tls", "1") == "1":
+        need_cert = True
+    if kind == "vless" and form.get("vless_tls", "1") == "1":
+        need_cert = True
+    if need_cert and not certs_present():
+        raise ValueError(f"{kind} 启用 TLS 需要域名证书，未找到 {CERT}（请先在服务器执行 clashserver cert）")
+
     port_s = form.get("port", "").strip()
     if port_s:
         if not port_s.isdigit() or not 1 <= int(port_s) <= 65535:
@@ -605,22 +895,26 @@ def build_inbound(kind: str, form: dict, env: dict) -> dict:
         raise ValueError(f"入站名称「{name}」已存在")
     vps = env.get("VPS_NAME", "vps")
     ip = env.get("SERVER_IP", "")
-    domain = env.get("DOMAIN", "").removeprefix("*.")
+    domain = env.get("DOMAIN", "").removeprefix("*.") or ip
     insecure = env.get("CERT_MODE") != "manual" and env.get("TLS", "") in ("staging", "internal")
     base = {"name": name, "port": port, "listen": "0.0.0.0"}
     label = f"{vps}-{name}"
 
     if kind == "vless-reality":
+        sni = (form.get("reality_sni") or REALITY_SNI).strip()
+        if not re.fullmatch(r"[A-Za-z0-9.-]{1,128}", sni):
+            raise ValueError("Reality 伪装域名（SNI）格式无效")
         priv, pub = reality_keypair()
         uid, sid = str(uuidlib.uuid4()), secrets.token_hex(4)
         listener = {**base, "type": "vless", "udp": True,
                     "users": [{"username": "user", "uuid": uid, "flow": "xtls-rprx-vision"}],
-                    "reality-config": {"dest": f"{REALITY_SNI}:443", "private-key": priv,
-                                       "short-id": [sid], "server-names": [REALITY_SNI]}}
+                    "reality-config": {"dest": f"{sni}:443", "private-key": priv,
+                                       "short-id": [sid], "server-names": [sni]}}
         client = {"name": f"{label}|Clash|Reality", "type": "vless", "server": ip, "port": port,
                   "uuid": uid, "tls": True, "flow": "xtls-rprx-vision", "client-fingerprint": "safari",
                   "skip-cert-verify": False, "reality-opts": {"public-key": pub, "short-id": sid},
-                  "network": "tcp", "udp": True, "servername": REALITY_SNI}
+                  "network": "tcp", "udp": True, "servername": sni}
+
     elif kind == "shadowsocks":
         cipher = (form.get("ss_cipher") or "aes-128-gcm").strip()
         if cipher not in SS_CIPHERS:
@@ -630,36 +924,238 @@ def build_inbound(kind: str, form: dict, env: dict) -> dict:
                     "listen": "0.0.0.0", "password": pw, "cipher": cipher}
         client = {"name": f"{label}|Clash|SS", "type": "ss", "server": ip, "port": port,
                   "cipher": cipher, "password": pw, "udp": True}
+
     elif kind == "hysteria2":
         pw = secrets.token_urlsafe(18)
+        obfs_pw = (form.get("hy2_obfs_pw") or "").strip()
         listener = {**base, "type": "hysteria2", "users": {"user": pw},
                     "certificate": CERT, "private-key": KEY, "alpn": ["h3"],
                     "ignore-client-bandwidth": False}
         client = {"name": f"{label}|Clash|Hy2", "type": "hysteria2", "server": domain, "port": port,
                   "password": pw, "sni": domain, "alpn": ["h3"], "skip-cert-verify": insecure,
                   "udp": True}
+        if obfs_pw:
+            listener["obfs"] = "salamander"
+            listener["obfs-password"] = obfs_pw
+            client["obfs"] = "salamander"
+            client["obfs-password"] = obfs_pw
+
     elif kind == "snell":
         version = int(form.get("snell_version") or 5)
         if version not in (4, 5):
             raise ValueError("snell 版本只能是 4 或 5")
+        obfs_mode = (form.get("snell_obfs") or "tls").strip()
+        if obfs_mode not in ("tls", "http"):
+            obfs_mode = "tls"
+        obfs_host = (form.get("snell_host") or REALITY_SNI).strip()
         psk = base64.b64encode(secrets.token_bytes(16)).decode()
         listener = {**base, "type": "snell", "psk": psk, "version": version, "udp": True,
-                    "obfs-opts": {"mode": "tls", "host": REALITY_SNI}}
+                    "obfs-opts": {"mode": obfs_mode, "host": obfs_host}}
         client = {"name": f"{label}|Clash|Snell", "type": "snell", "server": ip, "port": port,
                   "psk": psk, "version": version, "udp": True,
-                  "obfs-opts": {"mode": "tls", "host": REALITY_SNI}}
-    else:  # trusttunnel
+                  "obfs-opts": {"mode": obfs_mode, "host": obfs_host}}
+
+    elif kind == "trusttunnel":
         user = form.get("tt_user", "").strip() or "user"
         if not re.fullmatch(r"[A-Za-z0-9._-]{1,32}", user):
             raise ValueError("TrustTunnel 用户名无效（1-32 位字母、数字及 . _ -）")
+        cc = (form.get("tt_cc") or "bbr").strip()
+        if cc not in ("bbr", "cubic"):
+            cc = "bbr"
         pw = secrets.token_urlsafe(18)
         listener = {**base, "type": "trusttunnel", "users": [{"username": user, "password": pw}],
                     "certificate": CERT, "private-key": KEY, "network": ["tcp", "udp"],
-                    "congestion-controller": "bbr"}
-        # client fields for trusttunnel are best-effort (not connectivity-tested yet)
+                    "congestion-controller": cc}
         client = {"name": f"{label}|Clash|TrustTunnel", "type": "trusttunnel", "server": domain,
                   "port": port, "username": user, "password": pw, "sni": domain,
                   "skip-cert-verify": insecure, "udp": True}
+
+    elif kind == "http":
+        user = (form.get("http_user") or "user").strip()
+        pw = (form.get("http_pass") or "").strip() or secrets.token_urlsafe(14)
+        use_tls = form.get("http_tls") == "1"
+        listener = {**base, "type": "http", "users": [{"username": user, "password": pw}]}
+        if use_tls:
+            listener["certificate"] = CERT
+            listener["private-key"] = KEY
+        client = {"name": f"{label}|Clash|HTTP", "type": "http",
+                  "server": domain if use_tls else ip, "port": port,
+                  "username": user, "password": pw, "tls": use_tls, "udp": True}
+        if use_tls:
+            client["sni"] = domain
+            client["skip-cert-verify"] = insecure
+
+    elif kind == "socks":
+        user = (form.get("socks_user") or "user").strip()
+        pw = (form.get("socks_pass") or "").strip() or secrets.token_urlsafe(14)
+        use_tls = form.get("socks_tls") == "1"
+        listener = {**base, "type": "socks", "udp": True, "users": [{"username": user, "password": pw}]}
+        if use_tls:
+            listener["certificate"] = CERT
+            listener["private-key"] = KEY
+        client = {"name": f"{label}|Clash|SOCKS5", "type": "socks5",
+                  "server": domain if use_tls else ip, "port": port,
+                  "username": user, "password": pw, "tls": use_tls, "udp": True}
+        if use_tls:
+            client["skip-cert-verify"] = insecure
+
+    elif kind == "vmess":
+        uid = str(uuidlib.uuid4())
+        net = (form.get("vmess_net") or "ws").strip()
+        if net not in ("ws", "tcp", "grpc"):
+            net = "ws"
+        use_tls = form.get("vmess_tls", "1") == "1"
+        raw_path = (form.get("vmess_path") or "").strip()
+        path = raw_path if raw_path else ("/" + secrets.token_hex(4))
+        if not path.startswith("/"):
+            path = "/" + path
+        listener = {**base, "type": "vmess", "udp": True,
+                    "users": [{"username": "user", "uuid": uid, "alterId": 0}]}
+        if net == "ws":
+            listener["ws-path"] = path
+        elif net == "grpc":
+            listener["grpc-service-name"] = path.lstrip("/")
+        if use_tls:
+            listener["certificate"] = CERT
+            listener["private-key"] = KEY
+        srv = domain if use_tls else ip
+        client = {"name": f"{label}|Clash|VMess", "type": "vmess", "server": srv, "port": port,
+                  "uuid": uid, "alterId": 0, "cipher": "auto", "tls": use_tls, "udp": True}
+        if use_tls:
+            client["servername"] = domain
+            client["skip-cert-verify"] = insecure
+            client["client-fingerprint"] = "chrome"
+        if net == "ws":
+            client["network"] = "ws"
+            client["ws-opts"] = {"path": path, "headers": {"Host": srv}}
+        elif net == "grpc":
+            client["network"] = "grpc"
+            client["grpc-opts"] = {"grpc-service-name": path.lstrip("/")}
+
+    elif kind == "vless":
+        uid = str(uuidlib.uuid4())
+        net = (form.get("vless_net") or "tcp").strip()
+        if net not in ("tcp", "xhttp", "ws", "grpc"):
+            net = "tcp"
+        use_tls = form.get("vless_tls", "1") == "1"
+        use_enc = (form.get("vless_enc") or "none").strip() == "x25519"
+        raw_path = (form.get("vless_path") or "").strip()
+        path = raw_path if raw_path else ("/" + secrets.token_hex(4))
+        if not path.startswith("/"):
+            path = "/" + path
+        user_entry = {"username": "user", "uuid": uid}
+        if net == "tcp":
+            user_entry["flow"] = "xtls-rprx-vision"
+        listener = {**base, "type": "vless", "udp": True, "users": [user_entry]}
+        if use_tls:
+            listener["certificate"] = CERT
+            listener["private-key"] = KEY
+        srv = domain if use_tls else ip
+        client = {"name": f"{label}|Clash|VLESS", "type": "vless", "server": srv, "port": port,
+                  "uuid": uid, "tls": use_tls, "udp": True}
+        if use_tls:
+            client["servername"] = domain
+            client["skip-cert-verify"] = insecure
+            client["client-fingerprint"] = "chrome"
+        if net == "tcp":
+            client["network"] = "tcp"
+            client["flow"] = "xtls-rprx-vision"
+        elif net == "xhttp":
+            listener["xhttp-config"] = {"path": path, "mode": "auto", "x-padding-bytes": "100-1000"}
+            client["network"] = "xhttp"
+            client["xhttp-opts"] = {"path": path, "mode": "auto"}
+        elif net == "ws":
+            listener["ws-path"] = path
+            client["network"] = "ws"
+            client["ws-opts"] = {"path": path, "headers": {"Host": srv}}
+        elif net == "grpc":
+            listener["grpc-service-name"] = path.lstrip("/")
+            client["network"] = "grpc"
+            client["grpc-opts"] = {"grpc-service-name": path.lstrip("/")}
+        if use_enc:
+            dec, enc = vless_x25519_keypair()
+            listener["decryption"] = dec
+            client["encryption"] = enc
+
+    elif kind == "anytls":
+        user = (form.get("anytls_user") or "user").strip() or "user"
+        fp = (form.get("anytls_fp") or "chrome").strip()
+        if fp not in ("chrome", "safari", "firefox", "ios"):
+            fp = "chrome"
+        use_pad = form.get("anytls_padding", "1") == "1"
+        pw = secrets.token_urlsafe(18)
+        listener = {**base, "type": "anytls", "users": {user: pw},
+                    "certificate": CERT, "private-key": KEY}
+        if use_pad:
+            listener["padding-scheme"] = ANYTLS_DEFAULT_PADDING
+        client = {"name": f"{label}|Clash|AnyTLS", "type": "anytls", "server": domain, "port": port,
+                  "password": pw, "sni": domain, "client-fingerprint": fp,
+                  "skip-cert-verify": insecure, "udp": True}
+
+    elif kind == "mieru":
+        user = (form.get("mieru_user") or "user").strip() or "user"
+        transport = (form.get("mieru_transport") or "TCP").strip().upper()
+        if transport not in ("TCP", "UDP"):
+            transport = "TCP"
+        pw = secrets.token_urlsafe(16)
+        listener = {**base, "type": "mieru", "transport": transport, "users": {user: pw}}
+        client = {"name": f"{label}|Clash|Mieru", "type": "mieru", "server": ip, "port": port,
+                  "transport": transport, "username": user, "password": pw, "udp": True}
+
+    elif kind == "sudoku":
+        aead = (form.get("sudoku_aead") or "chacha20-poly1305").strip()
+        if aead not in ("chacha20-poly1305", "aes-128-gcm", "none"):
+            aead = "chacha20-poly1305"
+        table = (form.get("sudoku_table") or "prefer_ascii").strip()
+        if table not in ("prefer_ascii", "prefer_entropy", "up_ascii_down_entropy", "up_entropy_down_ascii"):
+            table = "prefer_ascii"
+        pure_dl = form.get("sudoku_pure_downlink", "1") == "1"
+        priv_k, pub_k = sudoku_keypair()
+        listener = {**base, "type": "sudoku", "key": pub_k, "aead-method": aead,
+                    "padding-min": 2, "padding-max": 7, "table-type": table,
+                    "enable-pure-downlink": pure_dl}
+        client = {"name": f"{label}|Clash|Sudoku", "type": "sudoku", "server": ip, "port": port,
+                  "key": priv_k, "aead-method": aead, "padding-min": 2, "padding-max": 7,
+                  "table-type": table, "enable-pure-downlink": pure_dl, "udp": True}
+
+    elif kind == "tuic":
+        uid = str(uuidlib.uuid4())
+        pw = secrets.token_urlsafe(18)
+        cc = (form.get("tuic_cc") or "bbr").strip()
+        if cc not in ("bbr", "cubic", "new_reno"):
+            cc = "bbr"
+        udp_mode = (form.get("tuic_udp_mode") or "native").strip()
+        if udp_mode not in ("native", "quic"):
+            udp_mode = "native"
+        listener = {**base, "type": "tuic", "users": {uid: pw},
+                    "certificate": CERT, "private-key": KEY,
+                    "congestion-controller": cc, "alpn": ["h3"]}
+        client = {"name": f"{label}|Clash|TUICv5", "type": "tuic", "server": domain, "port": port,
+                  "uuid": uid, "password": pw, "sni": domain, "alpn": ["h3"],
+                  "congestion-controller": cc, "udp-relay-mode": udp_mode,
+                  "reduce-rtt": True, "skip-cert-verify": insecure, "udp": True}
+
+    else:  # shadowquic
+        user = (form.get("sq_user") or "user").strip() or "user"
+        jls_addr = (form.get("sq_jls") or "www.microsoft.com:443").strip()
+        if ":" not in jls_addr:
+            jls_addr += ":443"
+        jls_host = jls_addr.rsplit(":", 1)[0]
+        cc = (form.get("sq_cc") or "bbr").strip()
+        if cc not in ("bbr", "cubic", "new_reno"):
+            cc = "bbr"
+        zero_rtt = form.get("sq_zero_rtt", "1") == "1"
+        pw = secrets.token_urlsafe(18)
+        listener = {**base, "type": "shadowquic",
+                    "users": [{"username": user, "password": pw}],
+                    "jls-upstream": {"addr": jls_addr},
+                    "congestion-controller": cc, "zero-rtt": zero_rtt,
+                    "quic-version-probe": True, "max-idle-time": 30000,
+                    "disable-mtu-discovery": False}
+        client = {"name": f"{label}|Clash|ShadowQUIC", "type": "shadowquic", "server": ip, "port": port,
+                  "username": user, "password": pw, "sni": jls_host, "alpn": ["h3"],
+                  "congestion-controller": cc, "zero-rtt": zero_rtt, "udp": True}
+
     return {"id": secrets.token_hex(6), "kind": kind, "port": port, "name": name,
             "created": int(time.time()), "listener": listener, "client": client}
 
@@ -696,12 +1192,14 @@ def render_reality(nodes: list) -> str:
 
 
 def render_extra(inbounds: list) -> str:
-    # YAML is a superset of JSON: one flow mapping per listener, no escaping pitfalls.
     return "".join("  - " + json.dumps(i["listener"], ensure_ascii=False) + "\n" for i in inbounds)
 
 
 def assemble_config() -> str:
-    """Same logic as core.sh assemble_config: template @@CONTROLLER@@ + @@PROXIES@@ + @@LISTENERS@@."""
+    """Same logic as core.sh assemble_config: custom_config.yaml if active, else template."""
+    if is_custom_config_mode():
+        with open(CUSTOM_CONF) as f:
+            return f.read()
     ctrl = ""
     try:
         with open(FRAG_CONTROLLER) as f:
@@ -709,15 +1207,17 @@ def assemble_config() -> str:
     except FileNotFoundError:
         env = read_env()
         if env.get("MODE") == "auto-cert" and env.get("MIHOMO_SECRET"):
-            cport = env.get("CONTROLLER_PORT") or "7896"
-            ctrl = (
-                f'external-controller-tls: "0.0.0.0:{cport}"\n'
-                f"tls:\n  certificate: {CERT}\n  private-key: {KEY}\n"
-                f"external-controller-cors:\n  allow-origins:\n    - '*'\n  allow-private-network: true\n"
-                f'secret: "{env["MIHOMO_SECRET"]}"\n'
-                f"external-ui: ui\n"
-                f'external-ui-url: "https://github.com/Zephyruso/zashboard/releases/latest/download/dist-cdn-fonts.zip"\n'
-            )
+            ctrl = render_controller_fragment(env)
+
+    providers_frag = ""
+    try:
+        with open(FRAG_PROVIDERS) as f:
+            providers_frag = f.read()
+    except FileNotFoundError:
+        pass
+    providers_lines = [l for l in providers_frag.splitlines() if l.strip()]
+    providers_block = ("proxy-providers:\n" + "\n".join(providers_lines) + "\n") if providers_lines else ""
+
     proxies_frag = ""
     try:
         with open(FRAG_PROXIES) as f:
@@ -735,11 +1235,15 @@ def assemble_config() -> str:
         except FileNotFoundError:
             pass
     out = []
-    with open(TEMPLATE) as f:
+    tpl_path = resolve_template_path("resources/server.yaml.tpl")
+    with open(tpl_path) as f:
         for line in f:
             s = line.rstrip("\n")
             if s == "@@CONTROLLER@@":
                 out.append(ctrl)
+            elif s == "@@PROXY_PROVIDERS@@":
+                if providers_block:
+                    out.append(providers_block)
             elif s == "@@PROXIES@@":
                 out.append(proxies_block)
             elif s == "@@LISTENERS@@":
@@ -767,21 +1271,38 @@ def atomic_write(path: str, data: str, mode=0o640):
 def validate_config(path=CONF):
     with tempfile.TemporaryDirectory() as d:
         os.makedirs(os.path.join(d, "ui"), exist_ok=True)
-        mmdb = ROOT + "/var/lib/mihomo/country.mmdb"
-        if os.path.isfile(mmdb):
-            try:
-                os.symlink(mmdb, os.path.join(d, "country.mmdb"))
-            except OSError:
-                pass
-        env = dict(os.environ, SAFE_PATHS="/etc/mihomo")
-        return run([MIHOMO_BIN, "-t", "-d", d, "-f", path], env=env, timeout=60)
+        for cert_src in (CS_ROOT + "/certs", ROOT + "/etc/mihomo/certs"):
+            if os.path.isdir(cert_src):
+                try:
+                    os.symlink(cert_src, os.path.join(d, "certs"))
+                except OSError:
+                    pass
+                break
+        for mmdb in (CS_ROOT + "/country.mmdb", ROOT + "/var/lib/mihomo/country.mmdb"):
+            if os.path.isfile(mmdb):
+                try:
+                    os.symlink(mmdb, os.path.join(d, "country.mmdb"))
+                except OSError:
+                    pass
+                break
+        safe = f"{CS_ROOT}:/etc/clashserve:/etc/mihomo"
+        test_path = path
+        if ROOT and os.path.isfile(path):
+            with open(path) as fp:
+                txt = fp.read()
+            if "/etc/clashserve/certs/" in txt and not os.path.isdir("/etc/clashserve/certs"):
+                test_path = os.path.join(d, "test_config.yaml")
+                with open(test_path, "w") as fp:
+                    fp.write(txt.replace("/etc/clashserve/certs/", CS_ROOT + "/certs/"))
+        env = dict(os.environ, SAFE_PATHS=safe)
+        return run([resolve_mihomo_bin(), "-t", "-d", d, "-f", test_path], env=env, timeout=60)
 
 
 def ufw_specs_for_node(kind: str, port: int) -> set:
     p = int(port)
-    if kind == "vless-reality":
+    if kind in ("vless-reality", "http"):
         return {f"{p}/tcp"}
-    if kind == "hysteria2":
+    if kind in ("hysteria2", "tuic", "shadowquic"):
         return {f"{p}/udp"}
     return {f"{p}/tcp", f"{p}/udp"}
 
@@ -801,7 +1322,8 @@ def sync_ufw(old_specs: set, new_specs: set):
     if rc != 0 or "Status: active" not in out:
         return
     env = read_env()
-    protected = {"80/tcp", f"{env.get('PANEL_PORT') or 0}/tcp", f"{env.get('CONTROLLER_PORT') or 7896}/tcp"}
+    cport = get_controller_port(env)
+    protected = {"80/tcp", f"{env.get('PANEL_PORT') or 0}/tcp", f"{cport}/tcp"}
     for spec in sorted(new_specs - old_specs):
         run([UFW_BIN, "allow", spec])
     for spec in sorted((old_specs - new_specs) - protected):
@@ -809,7 +1331,7 @@ def sync_ufw(old_specs: set, new_specs: set):
 
 
 def sync_client_files():
-    """Keep /root/clashserver-client/{mihomo-client,proxies}.yaml in sync with current nodes and inbounds."""
+    """Keep /etc/clashserve/client/{mihomo-client,proxies}.yaml in sync with current nodes and inbounds."""
     try:
         env = read_env()
         proxies = [reality_client(n, env) for n in read_nodes()] + [i["client"] for i in load_inbounds()]
@@ -826,7 +1348,7 @@ def wait_mihomo_ports(timeout=2.0):
     expected = {int(n["port"]) for n in read_nodes()} | {int(i["port"]) for i in load_inbounds()}
     env = read_env()
     if env.get("MODE") == "auto-cert":
-        expected.add(int(env.get("CONTROLLER_PORT") or 7896))
+        expected.add(get_controller_port(env))
     if not expected:
         return
     deadline = time.monotonic() + timeout
@@ -876,7 +1398,7 @@ def apply_inbounds(new: list):
 
 
 def apply_nodes(new_nodes: list):
-    """Update install-time VLESS Reality nodes (nodes.tsv + listeners.reality.yaml + config.yaml), validate, restart; roll back on failure."""
+    """Update install-time VLESS Reality nodes (nodes.tsv + listeners.reality.yaml + config.yaml), validate, restart."""
     cur_inbs = load_inbounds()
     old_specs = collect_ufw_specs(read_nodes(), cur_inbs)
     files = (NODES_TSV, FRAG_REALITY, CONF)
@@ -912,7 +1434,7 @@ def apply_nodes(new_nodes: list):
 
 
 def apply_server_proxies(new_proxies: list):
-    """Write server outbound proxies (proxies.json + proxies.extra.yaml + config.yaml), validate, restart; roll back on failure."""
+    """Write server outbound proxies (proxies.json + proxies.extra.yaml + config.yaml), validate, restart."""
     files = (PROXIES_JSON, FRAG_PROXIES, CONF)
     backup = {}
     for p in files:
@@ -943,6 +1465,108 @@ def apply_server_proxies(new_proxies: list):
     wait_mihomo_ports()
 
 
+def apply_proxy_providers(new_providers: dict):
+    """Write server proxy-providers (providers.json + providers.extra.yaml + config.yaml), validate, restart."""
+    files = (PROVIDERS_JSON, FRAG_PROVIDERS, CONF)
+    backup = {}
+    for p in files:
+        try:
+            with open(p) as f:
+                backup[p] = f.read()
+        except FileNotFoundError:
+            backup[p] = None
+    try:
+        atomic_write(PROVIDERS_JSON, json.dumps(new_providers, indent=2, ensure_ascii=False), 0o600)
+        atomic_write(FRAG_PROVIDERS, dump_yaml_providers(new_providers), 0o640)
+        atomic_write(CONF, assemble_config(), 0o640)
+        rc, out = validate_config()
+        if rc != 0:
+            raise RuntimeError("配置校验失败（mihomo -t）：" + out[-800:])
+        rc, out = run([SYSTEMCTL, "restart", "mihomo"])
+        if rc != 0:
+            raise RuntimeError("重启失败：" + out[-800:])
+    except Exception:
+        for p, data in backup.items():
+            if data is None:
+                if os.path.exists(p):
+                    os.remove(p)
+            else:
+                atomic_write(p, data, 0o600 if p == PROVIDERS_JSON else 0o640)
+        run([SYSTEMCTL, "restart", "mihomo"])
+        raise
+    wait_mihomo_ports()
+
+
+def apply_custom_config(raw_yaml: str):
+    """Validate and apply user-supplied full server config, updating custom_config.yaml and config.yaml."""
+    s = (raw_yaml or "").strip()
+    if not s:
+        raise ValueError("请输入完整的 mihomo 服务端配置内容")
+    s += "\n"
+    files = (CUSTOM_CONF, CONF)
+    backup = {}
+    for p in files:
+        try:
+            with open(p) as f:
+                backup[p] = f.read()
+        except FileNotFoundError:
+            backup[p] = None
+    try:
+        atomic_write(CUSTOM_CONF, s, 0o640)
+        atomic_write(CONF, s, 0o640)
+        rc, out = validate_config()
+        if rc != 0:
+            raise RuntimeError("配置校验失败（mihomo -t）：" + out[-800:])
+        sync_env_from_custom_config(s)
+        rc, out = run([SYSTEMCTL, "restart", "mihomo"])
+        if rc != 0:
+            raise RuntimeError("重启失败：" + out[-800:])
+    except Exception:
+        for p, data in backup.items():
+            if data is None:
+                if os.path.exists(p):
+                    os.remove(p)
+            else:
+                atomic_write(p, data, 0o640)
+        run([SYSTEMCTL, "restart", "mihomo"])
+        raise
+    wait_mihomo_ports()
+
+
+def reset_to_template_config():
+    """Exit custom config mode and re-assemble server config from standard template + fragments."""
+    files = (CUSTOM_CONF, CONF)
+    backup = {}
+    for p in files:
+        try:
+            with open(p) as f:
+                backup[p] = f.read()
+        except FileNotFoundError:
+            backup[p] = None
+    try:
+        if os.path.exists(CUSTOM_CONF):
+            os.remove(CUSTOM_CONF)
+        env = read_env()
+        atomic_write(FRAG_CONTROLLER, render_controller_fragment(env), 0o640)
+        atomic_write(CONF, assemble_config(), 0o640)
+        rc, out = validate_config()
+        if rc != 0:
+            raise RuntimeError("配置校验失败（mihomo -t）：" + out[-800:])
+        rc, out = run([SYSTEMCTL, "restart", "mihomo"])
+        if rc != 0:
+            raise RuntimeError("重启失败：" + out[-800:])
+    except Exception:
+        for p, data in backup.items():
+            if data is None:
+                if os.path.exists(p):
+                    os.remove(p)
+            else:
+                atomic_write(p, data, 0o640)
+        run([SYSTEMCTL, "restart", "mihomo"])
+        raise
+    wait_mihomo_ports()
+
+
 def reality_client(n: dict, env: dict) -> dict:
     """Client proxy for an install-time Reality node (same fields as core.sh proxy_line)."""
     return {"name": f"{env.get('VPS_NAME', 'vps')}-{n['name']}|Clash|Reality", "type": "vless",
@@ -958,7 +1582,8 @@ def render_subscription(env: dict) -> str:
     p_lines = "\n".join("    - " + json.dumps(p, ensure_ascii=False) for p in proxies)
     n_lines = "\n".join("      - " + json.dumps(p["name"], ensure_ascii=False) for p in proxies)
     out = []
-    with open(CLIENT_TEMPLATE) as f:
+    tpl_path = resolve_template_path("resources/client.yaml.tpl")
+    with open(tpl_path) as f:
         for line in f:
             key = line.rstrip("\n")
             if key == "@@PROXIES@@":
@@ -974,12 +1599,13 @@ def mihomo_status() -> dict:
     rc, active = run([SYSTEMCTL, "is-active", "mihomo"])
     _, show = run([SYSTEMCTL, "show", "mihomo", "-p", "ActiveEnterTimestamp,MainPID,NRestarts"])
     props = dict(l.split("=", 1) for l in show.splitlines() if "=" in l)
-    _, ver = run([MIHOMO_BIN, "-v"])
+    _, ver = run([resolve_mihomo_bin(), "-v"])
     _, ss = run(["ss", "-Hltun"])
     listening = {int(m) for m in re.findall(r":(\d+)\s", ss + " ")}
     cert = {}
     if certs_present():
-        _, c = run(["openssl", "x509", "-noout", "-enddate", "-issuer", "-in", ROOT + CERT])
+        crt_file = (ROOT + CERT) if os.path.isfile(ROOT + CERT) else (ROOT + "/etc/mihomo/certs/fullchain.pem")
+        _, c = run(["openssl", "x509", "-noout", "-enddate", "-issuer", "-in", crt_file])
         cert = {"info": c}
     return {"active": active.strip() or "unknown", "since": props.get("ActiveEnterTimestamp", ""),
             "pid": props.get("MainPID", ""), "restarts": props.get("NRestarts", ""),
@@ -987,127 +1613,202 @@ def mihomo_status() -> dict:
             "cert": cert}
 
 
-# ---------------------------------------------------------------- HTTP
+# ---------------------------------------------------------------- Rebuilt Console UI & HTTP
 CSS = """
-:root{--bg:#f3f5f9;--card:#fff;--text:#111827;--muted:#6b7280;--faint:#9ca3af;--line:#e8ebf0;
---primary:#4f46e5;--primary-h:#4338ca;--primary-soft:#eef2ff;--ok:#15803d;--ok-bg:#dcfce7;--bad:#b91c1c;
---bad-bg:#fee2e2;--warn:#b45309;--warn-bg:#fef3c7;--radius:14px;
---shadow:0 1px 2px rgba(16,24,40,.04),0 4px 16px rgba(16,24,40,.06)}
+:root{
+  --bg:#f1f5f9;--card:#ffffff;--surface:#f8fafc;--text:#0f172a;--muted:#475569;--faint:#94a3b8;
+  --line:#e2e8f0;--line-strong:#cbd5e1;
+  --primary:#4f46e5;--primary-h:#4338ca;--primary-soft:#eef2ff;--primary-ring:rgba(79,70,229,.18);
+  --ok:#15803d;--ok-bg:#dcfce7;--bad:#b91c1c;--bad-bg:#fee2e2;--warn:#b45309;--warn-bg:#fef3c7;
+  --radius:14px;--shadow:0 1px 3px rgba(15,23,42,.05),0 6px 20px rgba(15,23,42,.04)
+}
 *{box-sizing:border-box}
 html{-webkit-text-size-adjust:100%}
-body{margin:0;background:var(--bg);color:var(--text);font:14px/1.65 -apple-system,BlinkMacSystemFont,"PingFang SC",
+body{margin:0;background:var(--bg);color:var(--text);font:14px/1.6 -apple-system,BlinkMacSystemFont,"PingFang SC",
 "Hiragino Sans GB","Microsoft YaHei","Noto Sans CJK SC","Segoe UI",sans-serif;-webkit-font-smoothing:antialiased}
 a{color:var(--primary);text-decoration:none}
-.topbar{background:rgba(255,255,255,.9);backdrop-filter:blur(8px);border-bottom:1px solid var(--line);
-position:sticky;top:0;z-index:10}
-.topbar .in{max-width:1120px;margin:0 auto;padding:12px 24px;display:flex;align-items:center;gap:14px}
-.logo{width:34px;height:34px;border-radius:10px;background:linear-gradient(135deg,#6366f1,#8b5cf6);color:#fff;
-display:flex;align-items:center;justify-content:center;font-weight:800;font-size:16px;flex:none;
-box-shadow:0 4px 10px rgba(99,102,241,.35)}
-.brand{display:flex;flex-direction:column;line-height:1.25}.brand b{font-size:16px;letter-spacing:.2px;display:flex;align-items:center;gap:6px}
-.brand small{color:var(--muted);font-size:12px}
-.chip{display:inline-flex;align-items:center;gap:6px;background:#f3f4f6;color:#374151;border-radius:999px;
-padding:3px 12px;font-size:12px}
+.topbar{background:rgba(15,23,42,.95);backdrop-filter:blur(10px);color:#f8fafc;border-bottom:1px solid rgba(255,255,255,.08);
+position:sticky;top:0;z-index:30}
+.topbar .in{max-width:1220px;margin:0 auto;padding:12px 24px;display:flex;align-items:center;gap:14px;flex-wrap:wrap}
+.logo{width:36px;height:36px;border-radius:10px;background:linear-gradient(135deg,#6366f1,#8b5cf6);color:#fff;
+display:flex;align-items:center;justify-content:center;font-weight:800;font-size:17px;flex:none;
+box-shadow:0 4px 12px rgba(99,102,241,.45)}
+.brand{display:flex;flex-direction:column;line-height:1.25}
+.brand b{font-size:16px;letter-spacing:.2px;display:flex;align-items:center;gap:8px;color:#fff}
+.brand small{color:#94a3b8;font-size:12px}
+.chip{display:inline-flex;align-items:center;gap:6px;background:rgba(255,255,255,.1);color:#e2e8f0;border-radius:999px;
+padding:4px 12px;font-size:12px;border:1px solid rgba(255,255,255,.12)}
 .dot{width:8px;height:8px;border-radius:50%;background:var(--faint);display:inline-block}
-.dot.ok{background:#22c55e;box-shadow:0 0 0 3px #dcfce7}.dot.bad{background:#ef4444;box-shadow:0 0 0 3px #fee2e2}
-.dot.warn{background:#f59e0b;box-shadow:0 0 0 3px #fef3c7}
+.dot.ok{background:#22c55e;box-shadow:0 0 0 3px rgba(34,197,94,.25)}
+.dot.bad{background:#ef4444;box-shadow:0 0 0 3px rgba(239,68,68,.25)}
+.dot.warn{background:#f59e0b;box-shadow:0 0 0 3px rgba(245,158,11,.25)}
 .spacer{flex:1}
-main{max-width:1120px;margin:0 auto;padding:28px 24px 56px}
-.page-h{display:flex;align-items:flex-end;justify-content:space-between;gap:12px;margin:0 0 20px;flex-wrap:wrap}
-.page-h h1{font-size:22px;margin:0;font-weight:700;display:flex;align-items:center;gap:8px}.page-h p{margin:2px 0 0;color:var(--muted)}
-.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:16px;margin-bottom:20px}
+main{max-width:1220px;margin:0 auto;padding:24px 24px 56px}
+.hero-bar{background:var(--card);border:1px solid var(--line);border-radius:var(--radius);box-shadow:var(--shadow);
+padding:18px 22px;margin-bottom:18px;display:flex;align-items:center;justify-content:space-between;gap:16px;flex-wrap:wrap}
+.hero-meta{display:flex;align-items:center;gap:16px;flex-wrap:wrap}
+.hero-meta h1{font-size:19px;margin:0;font-weight:700;display:flex;align-items:center;gap:8px}
+.hero-kv{display:flex;gap:16px;flex-wrap:wrap;color:var(--muted);font-size:13px}
+.hero-kv span b{color:var(--text);font-weight:600}
+.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:14px;margin-bottom:18px}
 .stat{background:var(--card);border:1px solid var(--line);border-radius:var(--radius);box-shadow:var(--shadow);
-padding:16px 18px}
-.stat .lb{color:var(--muted);font-size:12px;display:flex;align-items:center;gap:6px}
-.stat .val{font-size:22px;font-weight:700;margin-top:4px;line-height:1.3;word-break:break-all}
+padding:15px 18px;position:relative;overflow:hidden}
+.stat::before{content:"";position:absolute;left:0;top:0;bottom:0;width:4px;background:var(--primary)}
+.stat .lb{color:var(--muted);font-size:12px;display:flex;align-items:center;gap:6px;font-weight:500}
+.stat .val{font-size:22px;font-weight:750;margin-top:4px;line-height:1.25;word-break:break-all}
 .stat .val small{font-size:13px;font-weight:500;color:var(--muted);margin-left:4px}
-.stat .sub{font-size:12px;color:var(--faint);margin-top:2px}
-.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(340px,1fr));gap:20px;margin-bottom:20px}
+.stat .sub{font-size:12px;color:var(--faint);margin-top:3px}
+.nav-tabs{display:flex;gap:8px;background:var(--card);border:1px solid var(--line);border-radius:12px;padding:6px;
+margin-bottom:20px;box-shadow:var(--shadow);flex-wrap:wrap;align-items:center}
+.tab-btn{border:0;background:transparent;color:var(--muted);padding:9px 16px;border-radius:9px;font:inherit;
+font-weight:600;cursor:pointer;display:inline-flex;align-items:center;gap:7px;transition:all .15s}
+.tab-btn:hover{color:var(--text);background:var(--surface)}
+.tab-btn.active{background:var(--primary);color:#fff;box-shadow:0 2px 6px rgba(79,70,229,.3)}
+.tab-pane{display:none}
+.tab-pane.active,body.show-all .tab-pane{display:block}
+.split-2{display:grid;grid-template-columns:1.25fr 1fr;gap:20px;align-items:start}
 .card{background:var(--card);border:1px solid var(--line);border-radius:var(--radius);box-shadow:var(--shadow);
 padding:22px 24px;margin-bottom:20px}
-.grid .card{margin-bottom:0}
 .card-h{display:flex;align-items:center;gap:10px;margin:0 0 16px;flex-wrap:wrap}
-.card-h h2{font-size:16px;margin:0;font-weight:650}.card-h .desc{color:var(--muted);font-size:12px;width:100%;margin-top:-6px}
-.kv{display:grid;grid-template-columns:96px 1fr;row-gap:10px;margin:0 0 18px}
-.kv dt{color:var(--muted)}.kv dd{margin:0;word-break:break-all}
-.pill{display:inline-flex;align-items:center;gap:5px;padding:1px 10px;border-radius:999px;font-size:12px;font-weight:600;
-white-space:nowrap}
+.card-h h2{font-size:16px;margin:0;font-weight:700}.card-h .desc{color:var(--muted);font-size:12.5px;width:100%;margin-top:-4px}
+.pill{display:inline-flex;align-items:center;gap:5px;padding:2px 10px;border-radius:999px;font-size:12px;font-weight:600;white-space:nowrap}
 .pill.ok{background:var(--ok-bg);color:var(--ok)}.pill.bad{background:var(--bad-bg);color:var(--bad)}
 .pill.warn{background:var(--warn-bg);color:var(--warn)}.pill.tag{background:var(--primary-soft);color:var(--primary-h)}
-.pill.gray{background:#f3f4f6;color:#4b5563}
-.k-vless-reality{background:#ede9fe;color:#6d28d9}.k-shadowsocks{background:#fce7f3;color:#be185d}
-.k-hysteria2{background:#e0f2fe;color:#0369a1}.k-snell{background:#dcfce7;color:#15803d}
-.k-trusttunnel{background:#ffedd5;color:#c2410c}
-.btn{display:inline-flex;align-items:center;justify-content:center;gap:6px;border:1px solid var(--line);background:#fff;
-color:var(--text);border-radius:9px;padding:8px 16px;font:inherit;font-weight:500;cursor:pointer;
-transition:background .15s,border-color .15s,box-shadow .15s}
-.btn:hover{background:#f9fafb;border-color:#d1d5db}
+.pill.gray{background:#f1f5f9;color:#475569}
+.k-vless-reality,.k-vless{background:#ede9fe;color:#6d28d9}.k-shadowsocks{background:#fce7f3;color:#be185d}
+.k-hysteria2,.k-tuic{background:#e0f2fe;color:#0369a1}.k-snell,.k-mieru{background:#dcfce7;color:#15803d}
+.k-trusttunnel,.k-anytls{background:#ffedd5;color:#c2410c}.k-vmess{background:#fef3c7;color:#b45309}
+.k-sudoku,.k-shadowquic{background:#e0e7ff;color:#3730a3}.k-http,.k-socks{background:#f1f5f9;color:#334155}
+.btn{display:inline-flex;align-items:center;justify-content:center;gap:6px;border:1px solid var(--line-strong);background:#fff;
+color:var(--text);border-radius:9px;padding:8px 15px;font:inherit;font-weight:550;cursor:pointer;
+transition:background .15s,border-color .15s,box-shadow .15s;white-space:nowrap}
+.btn:hover{background:var(--surface);border-color:#94a3b8}
 .btn.primary{background:var(--primary);border-color:var(--primary);color:#fff;box-shadow:0 1px 2px rgba(79,70,229,.3)}
 .btn.primary:hover{background:var(--primary-h)}
-.btn.danger{color:var(--bad)}.btn.danger:hover{background:var(--bad-bg);border-color:#fecaca}
-.btn.ghost{border-color:transparent;background:transparent;color:var(--muted)}.btn.ghost:hover{background:#f3f4f6;color:var(--text)}
-.btn.sm{padding:4px 12px;font-size:12px;border-radius:8px}
+.btn.warn{background:#fffbeb;border-color:#fde68a;color:#92400e}.btn.warn:hover{background:#fef3c7}
+.btn.danger{color:var(--bad);border-color:#fecaca}.btn.danger:hover{background:var(--bad-bg);border-color:#fca5a5}
+.btn.ghost{border-color:rgba(255,255,255,.18);background:rgba(255,255,255,.08);color:#e2e8f0}
+.btn.ghost:hover{background:rgba(255,255,255,.16);color:#fff}
+.btn.sm{padding:5px 12px;font-size:12px;border-radius:8px}
 .row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
 form.inline{display:inline}
-.flash{display:flex;gap:10px;align-items:flex-start;border-radius:12px;padding:12px 16px;margin-bottom:20px;
-word-break:break-all;border:1px solid transparent}
+.flash{display:flex;gap:10px;align-items:flex-start;border-radius:12px;padding:12px 16px;margin-bottom:18px;
+word-break:break-all;border:1px solid transparent;font-weight:500}
 .flash.ok{background:#f0fdf4;color:#14532d;border-color:#bbf7d0}.flash.bad{background:#fef2f2;color:#7f1d1d;border-color:#fecaca}
-.list{border:1px solid var(--line);border-radius:12px;overflow:hidden}
+.list{border:1px solid var(--line);border-radius:12px;overflow:hidden;background:#fff}
 .item{padding:14px 16px;border-bottom:1px solid var(--line)}.item:last-child{border-bottom:0}
-.item:hover{background:#fafbfc}
-.item .top{display:flex;align-items:center;gap:12px;flex-wrap:wrap}
-.item .nm{font-weight:600;min-width:0;word-break:break-all}
-.item .meta{color:var(--muted);font-size:12px;display:flex;gap:14px;flex-wrap:wrap;margin-top:2px}
+.item:hover{background:var(--surface)}
+.item .top{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+.item .nm{font-weight:650;min-width:0;word-break:break-all}
+.item .meta{color:var(--muted);font-size:12px;display:flex;gap:14px;flex-wrap:wrap;margin-top:3px}
 .item .acts{margin-left:auto;display:flex;gap:8px;align-items:center}
 .mono,code,pre,textarea{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
-code{background:#f3f4f6;border-radius:5px;padding:1px 6px;font-size:12px;white-space:nowrap}
+code{background:#f1f5f9;border-radius:5px;padding:2px 6px;font-size:12px;white-space:nowrap;color:#334155}
 pre{background:#0f172a;color:#e2e8f0;border-radius:10px;padding:14px;font-size:12px;white-space:pre-wrap;
 word-break:break-all;margin:10px 0 0;line-height:1.55}
-details>summary{cursor:pointer;color:var(--primary);font-size:12px;list-style:none;display:inline-flex;
-align-items:center;gap:4px;user-select:none}
+details>summary{cursor:pointer;color:var(--primary);font-size:12px;font-weight:500;list-style:none;display:inline-flex;
+align-items:center;gap:4px;user-select:none;margin-top:6px}
 details>summary::-webkit-details-marker{display:none}
 details>summary::before{content:"▸";transition:transform .15s}details[open]>summary::before{transform:rotate(90deg)}
-.muted{color:var(--muted)}.empty{color:var(--muted);text-align:center;padding:36px 16px}
-.form-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:16px;margin-bottom:18px}
-label{display:block;font-size:13px;color:#374151;font-weight:500;margin-bottom:6px}
-input,select{width:100%;height:38px;padding:0 12px;border:1px solid #d1d5db;border-radius:9px;font:inherit;
+.muted{color:var(--muted)}.empty{color:var(--muted);text-align:center;padding:32px 16px}
+.form-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(195px,1fr));gap:14px;margin-bottom:16px}
+label{display:block;font-size:12.5px;color:#334155;font-weight:600;margin-bottom:6px}
+input,select{width:100%;height:38px;padding:0 12px;border:1px solid var(--line-strong);border-radius:9px;font:inherit;
 background:#fff;color:var(--text)}
-textarea{width:100%;min-height:110px;padding:10px 12px;border:1px solid #d1d5db;border-radius:9px;font-size:12px;
-line-height:1.5;background:#fff;color:var(--text);resize:vertical}
+textarea{width:100%;min-height:115px;padding:10px 12px;border:1px solid var(--line-strong);border-radius:9px;font-size:12px;
+line-height:1.55;background:#fff;color:var(--text);resize:vertical}
+textarea.code-ed{background:#0f172a;color:#e2e8f0;border-color:#334155;min-height:320px;font-size:12.5px}
 input::placeholder,textarea::placeholder{color:var(--faint)}
-input:focus,select:focus,textarea:focus{outline:0;border-color:var(--primary);box-shadow:0 0 0 3px rgba(99,102,241,.18)}
-.hint{font-size:12px;color:var(--muted);margin:14px 0 0}
-.notice{font-size:13px;border-radius:10px;padding:10px 14px;margin-top:14px;background:var(--warn-bg);color:#78350f}
-.sub-box{display:flex;gap:10px;align-items:stretch;flex-wrap:wrap}
-.sub-box .url{flex:1;min-width:240px;background:#f8fafc;border:1px solid var(--line);border-radius:9px;padding:9px 12px;
-font-size:12px;word-break:break-all}
-.sub-sec{border-top:1px solid var(--line);margin-top:18px;padding-top:18px}
-footer{max-width:1120px;margin:0 auto;padding:0 24px 32px;color:var(--faint);font-size:12px;text-align:center}
+input:focus,select:focus,textarea:focus{outline:0;border-color:var(--primary);box-shadow:0 0 0 3px var(--primary-ring)}
+.hint{font-size:12px;color:var(--muted);margin:12px 0 0}
+.notice{font-size:13px;border-radius:10px;padding:12px 15px;margin:12px 0;background:var(--warn-bg);color:#78350f;border:1px solid #fde68a}
+.notice b{color:#92400e}
+.sub-box{display:flex;gap:8px;align-items:stretch;flex-wrap:wrap}
+.sub-box .url{flex:1;min-width:220px;background:var(--surface);border:1px solid var(--line);border-radius:9px;padding:9px 12px;
+font-size:12px;word-break:break-all;display:flex;align-items:center}
+.sub-sec{border-top:1px solid var(--line);margin-top:20px;padding-top:20px}
+footer{max-width:1220px;margin:0 auto;padding:0 24px 32px;color:var(--faint);font-size:12px;text-align:center}
 .login-wrap{min-height:100vh;display:flex;align-items:center;justify-content:center;padding:24px;
 background:radial-gradient(1200px 600px at 10% -10%,#e0e7ff 0,transparent 60%),
 radial-gradient(900px 500px at 110% 110%,#ede9fe 0,transparent 60%),var(--bg)}
-.login{width:100%;max-width:400px}
+.login{width:100%;max-width:410px}
 .login .card{padding:34px 32px;margin:0}
 .login .head{display:flex;align-items:center;gap:12px;margin-bottom:22px}
 .login h1{font-size:20px;margin:0;display:flex;align-items:center;gap:8px}.login p.sub{color:var(--muted);margin:0;font-size:13px}
 .login .field{margin-bottom:16px}.login .btn{width:100%;height:40px;margin-top:6px}
-.login .foot{text-align:center;color:var(--faint);font-size:12px;margin-top:18px}
 .err{background:#fef2f2;border:1px solid #fecaca;color:#7f1d1d;border-radius:10px;padding:10px 12px;margin-bottom:16px}
-@media (max-width:640px){.hide-sm{display:none}.stats{grid-template-columns:repeat(2,1fr);gap:12px}.stat .val{font-size:18px}.grid{grid-template-columns:1fr}main{padding:20px 14px 40px}.topbar .in{padding:10px 14px}
-.card{padding:18px}.item .acts{margin-left:0;width:100%}}
+@media (max-width:920px){.split-2{grid-template-columns:1fr}}
+@media (max-width:640px){.hide-sm{display:none}.stats{grid-template-columns:repeat(2,1fr);gap:10px}.stat .val{font-size:18px}
+main{padding:16px 12px 40px}.topbar .in{padding:10px 14px}.card{padding:16px}.item .acts{margin-left:0;width:100%}}
 """
 
 JS = """
 function syncKind(){var k=document.getElementById('kind');if(!k)return;var v=k.value;
-document.querySelectorAll('[data-kind]').forEach(function(e){e.style.display=e.dataset.kind===v?'':'none'})}
-function copyText(id,btn){var t=document.getElementById(id).textContent;var o=btn.textContent;
+document.querySelectorAll('[data-kind]').forEach(function(e){
+var list=(e.dataset.kind||'').split(',');
+e.style.display=list.indexOf(v)>=0?'':'none';
+})}
+function switchTab(id,btn){
+document.body.classList.remove('show-all');
+var allBtn=document.getElementById('toggle-all-btn');if(allBtn)allBtn.textContent='展开全部视图';
+document.querySelectorAll('.tab-pane').forEach(function(p){p.classList.toggle('active',p.id==='tab-'+id)});
+document.querySelectorAll('.tab-btn[data-tab]').forEach(function(b){b.classList.toggle('active',b.dataset.tab===id)});
+try{sessionStorage.setItem('cs_tab',id)}catch(e){}
+}
+function toggleAllTabs(btn){
+var on=document.body.classList.toggle('show-all');
+btn.textContent=on?'返回分栏视图':'展开全部视图';
+}
+function copyText(id,btn){var el=document.getElementById(id);if(!el)return;
+var t=el.value!==undefined&&el.tagName==='TEXTAREA'?el.value:el.textContent;var o=btn.textContent;
 function done(){btn.textContent='已复制';setTimeout(function(){btn.textContent=o},1500)}
 if(navigator.clipboard){navigator.clipboard.writeText(t).then(done,function(){fallback()})}else{fallback()}
 function fallback(){var a=document.createElement('textarea');a.value=t;document.body.appendChild(a);a.select();
 try{document.execCommand('copy');done()}catch(e){}document.body.removeChild(a)}}
-function loadProxyFile(inp){var f=inp.files&&inp.files[0];if(!f)return;
-var r=new FileReader();r.onload=function(){var ta=document.getElementById('proxies-raw');if(ta)ta.value=r.result||''};
+function loadFileToTextarea(inp,targetId){var f=inp.files&&inp.files[0];if(!f)return;
+var r=new FileReader();r.onload=function(){var ta=document.getElementById(targetId);if(ta)ta.value=r.result||''};
 r.readAsText(f)}
+function loadProxyFile(inp){loadFileToTextarea(inp,'proxies-raw')}
+function autoFixCertPaths(){
+var ta=document.getElementById('custom-config-raw');if(!ta)return;
+var certPath='/etc/clashserve/certs/fullchain.pem';
+var keyPath='/etc/clashserve/certs/privkey.pem';
+var cport=ta.dataset.cport||'';
+var secret=ta.dataset.secret||'';
+var lines=ta.value.split(/\\r?\\n/);
+var inReality=false,realityIndent=0,inProviders=false,provIndent=0,changed=0;
+for(var i=0;i<lines.length;i++){
+var line=lines[i];
+var stripped=line.replace(/^ +/,'');
+var indent=line.length-stripped.length;
+if(stripped&&stripped.charAt(0)!=='#'){
+if(inReality&&indent<=realityIndent)inReality=false;
+if(inProviders&&indent<=provIndent)inProviders=false;
+if(/^reality-config\\s*:/.test(stripped)){inReality=true;realityIndent=indent;continue}
+if(/^proxy-providers\\s*:/.test(stripped)){inProviders=true;provIndent=indent;continue}
+if(inProviders&&indent===provIndent+2&&/^default\\s*:\\s*(#.*)?$/.test(stripped)){
+lines[i]=line.slice(0,indent)+stripped.replace(/^default(\\s*:)/,'default-sub$1');changed++;continue}
+if(cport&&/^external-controller-tls\\s*:/.test(stripped)&&stripped.indexOf('随机端口')>=0){
+lines[i]=line.slice(0,indent)+'external-controller-tls: "0.0.0.0:'+cport+'"';changed++;continue}
+if(secret&&/^secret\\s*:/.test(stripped)&&stripped.indexOf('填充随机密码')>=0){
+lines[i]=line.slice(0,indent)+'secret: "'+secret+'"';changed++;continue}
+var mc=stripped.match(/^((?:-\\s+)?certificate\\s*:\\s*)([^#\\n]+?)(\\s*(?:#.*)?)$/);
+if(mc){
+var cv=mc[2].trim().replace(/^['"]|['"]$/g,'');
+if(cv!==certPath)changed++;
+lines[i]=line.slice(0,indent)+mc[1]+certPath+(mc[3]||'');continue}
+if(!inReality){
+var mk=stripped.match(/^((?:-\\s+)?private-key\\s*:\\s*)([^#\\n]+?)(\\s*(?:#.*)?)$/);
+if(mk){
+var kv=mk[2].trim().replace(/^['"]|['"]$/g,'');
+if(kv.indexOf('/')>=0||kv.indexOf('.')>=0||/key|pem/i.test(kv)){
+if(kv!==keyPath)changed++;
+lines[i]=line.slice(0,indent)+mk[1]+keyPath+(mk[3]||'');continue}
+}}}
+}
+ta.value=lines.join('\\n');
+showFlash('已自动修正 '+changed+' 处证书路径/占位配置（统一指向 /etc/clashserve/certs/），请点击「更新面板」保存生效。',true);
+}
 function showFlash(msg,ok){var box=document.getElementById('flash-box');if(!box)return;
 var div=document.createElement('div');div.className='flash '+(ok?'ok':'bad');
 var b=document.createElement('b');b.textContent=ok?'✓':'!';
@@ -1131,9 +1832,14 @@ showFlash(d.msg||(d.ok?'操作成功':'操作失败'),!!d.ok);
 if(d.stats_html){var sb=document.getElementById('stats-bar');if(sb)sb.outerHTML=d.stats_html}
 if(d.inbounds_html){var ic=document.getElementById('inbounds-card');if(ic){ic.outerHTML=d.inbounds_html;bindAjaxForms(document.getElementById('inbounds-card'))}}
 if(d.proxies_html){var pc=document.getElementById('proxies-section');if(pc){pc.outerHTML=d.proxies_html;bindAjaxForms(document.getElementById('proxies-section'))}}
+if(d.providers_html){var pvc=document.getElementById('providers-section');if(pvc){pvc.outerHTML=d.providers_html;bindAjaxForms(document.getElementById('providers-section'))}}
+if(d.custom_cfg_html){var cc=document.getElementById('custom-config-section');if(cc){cc.outerHTML=d.custom_cfg_html;bindAjaxForms(document.getElementById('custom-config-section'))}}
+if(d.zb_url){var zbu=document.getElementById('zb-url');if(zbu)zbu.textContent=d.zb_url;var zbo=document.getElementById('zb-open-btn');if(zbo)zbo.href=d.zb_url}
 if(d.ok){
 var p=f.querySelector('input[name=port]');if(p)p.value='';
 var n=f.querySelector('input[name=name]');if(n)n.value='';
+var u=f.querySelector('input[name=sub_url]');if(u)u.value='';
+var pn=f.querySelector('input[name=provider_name]');if(pn)pn.value='';
 var ta=f.querySelector('textarea[name=proxies_raw]');if(ta)ta.value='';
 var fi=f.querySelector('input[type=file]');if(fi)fi.value='';
 }
@@ -1145,6 +1851,7 @@ var fi=f.querySelector('input[type=file]');if(fi)fi.value='';
 }
 document.addEventListener('DOMContentLoaded',function(){var k=document.getElementById('kind');
 if(k){k.addEventListener('change',syncKind);syncKind()}
+try{var saved=sessionStorage.getItem('cs_tab');if(saved&&document.getElementById('tab-'+saved))switchTab(saved)}catch(e){}
 bindAjaxForms(document);
 document.querySelectorAll('form[data-busy]:not([data-ajax])').forEach(function(f){f.addEventListener('submit',function(){
 var b=f.querySelector('button[type=submit],button:not([type])');if(b){b.disabled=true;b.textContent=f.dataset.busy}})})});
@@ -1153,8 +1860,22 @@ var b=f.querySelector('button[type=submit],button:not([type])');if(b){b.disabled
 STATE_ZH = {"active": ("运行中", "ok"), "inactive": ("已停止", "bad"), "failed": ("失败", "bad"),
             "activating": ("启动中", "warn"), "deactivating": ("停止中", "warn"),
             "reloading": ("重载中", "warn"), "unknown": ("未知", "bad")}
-KIND_ZH = {"vless-reality": "VLESS Reality", "shadowsocks": "Shadowsocks (SS)",
-           "hysteria2": "Hysteria2", "snell": "Snell", "trusttunnel": "TrustTunnel"}
+KIND_ZH = {
+    "vless-reality": "VLESS Reality（免证书推荐）",
+    "shadowsocks": "Shadowsocks / SS（aes128/256）",
+    "hysteria2": "Hysteria2（QUIC / TLS）",
+    "snell": "Snell（v4 / v5）",
+    "trusttunnel": "TrustTunnel（HTTP2/HTTP3）",
+    "vless": "VLESS（TLS / XHTTP / WS / 加密）",
+    "vmess": "VMess（WS / TCP / gRPC）",
+    "anytls": "AnyTLS（TLS 伪装填充）",
+    "tuic": "TUIC v5（QUIC / TLS）",
+    "shadowquic": "ShadowQUIC（QUIC + JLS）",
+    "mieru": "Mieru（TCP / UDP 混淆）",
+    "sudoku": "Sudoku（数独矩阵混淆）",
+    "http": "HTTP（标准代理）",
+    "socks": "SOCKS5（标准代理）",
+}
 
 
 def short_version(v: str) -> str:
@@ -1266,9 +1987,12 @@ class Panel(BaseHTTPRequestHandler):
         payload = {
             "ok": ok,
             "msg": msg,
+            "zb_url": zashboard_url(env),
             "stats_html": self.render_stats_section(st),
             "inbounds_html": self.render_inbounds_section(s, env, st),
             "proxies_html": self.render_proxies_section(s),
+            "providers_html": self.render_providers_section(s),
+            "custom_cfg_html": self.render_custom_config_section(s, env),
         }
         return self.send(200 if ok else 400, json.dumps(payload, ensure_ascii=False), "application/json; charset=utf-8")
 
@@ -1289,7 +2013,7 @@ class Panel(BaseHTTPRequestHandler):
 
     def form(self):
         n = int(self.headers.get("Content-Length") or 0)
-        if n > 262144:
+        if n > 1048576:
             raise ValueError("请求体过大")
         raw = self.rfile.read(n).decode()
         return {k: v[0] for k, v in parse_qs(raw, keep_blank_values=True).items()}
@@ -1316,10 +2040,13 @@ class Panel(BaseHTTPRequestHandler):
         if path == "/api/status":
             st = mihomo_status()
             st["version_panel"] = VERSION
+            st["custom_config_mode"] = is_custom_config_mode()
             st["inbounds"] = [{k: i[k] for k in ("id", "kind", "name", "port")} for i in load_inbounds()]
             st["reality_nodes"] = [{"name": n["name"], "port": n["port"]} for n in read_nodes()]
-            st["server_proxies"] = [{"name": p["name"], "type": p["type"], "server": p["server"], "port": p["port"]}
+            st["server_proxies"] = [{"name": p.get("name", ""), "type": p.get("type", ""),
+                                     "server": p.get("server", ""), "port": p.get("port", "")}
                                     for p in load_server_proxies()]
+            st["proxy_providers"] = list(load_proxy_providers().keys())
             return self.send(200, json.dumps(st), "application/json")
         self.simple(404, "页面不存在", "请检查地址是否正确。")
 
@@ -1355,6 +2082,14 @@ class Panel(BaseHTTPRequestHandler):
             return self.do_add_proxies(s, form)
         if path == "/proxies/delete":
             return self.do_delete_proxy(s, form.get("name", ""))
+        if path == "/providers/add":
+            return self.do_add_provider(s, form)
+        if path == "/providers/delete":
+            return self.do_delete_provider(s, form.get("name", ""))
+        if path == "/config/custom":
+            return self.do_save_custom_config(s, form)
+        if path == "/config/reset-template":
+            return self.do_reset_template_config(s)
         m = re.fullmatch(r"/inbounds/([0-9a-f]{12})/delete", path)
         if m:
             return self.do_delete(s, m.group(1))
@@ -1435,7 +2170,7 @@ class Panel(BaseHTTPRequestHandler):
         with LOCK:
             old_env = read_env()
             old_secret = old_env.get("MIHOMO_SECRET", "")
-            files = (FRAG_CONTROLLER, CONF)
+            files = (FRAG_CONTROLLER, CUSTOM_CONF, CONF)
             backup = {}
             for p in files:
                 try:
@@ -1447,6 +2182,9 @@ class Panel(BaseHTTPRequestHandler):
                 write_env_var("MIHOMO_SECRET", new_secret)
                 env = read_env()
                 atomic_write(FRAG_CONTROLLER, render_controller_fragment(env), 0o640)
+                if is_custom_config_mode() and backup[CUSTOM_CONF]:
+                    updated = re.sub(r'^(\s*secret\s*:\s*).*$', f'\\1"{new_secret}"', backup[CUSTOM_CONF], flags=re.M)
+                    atomic_write(CUSTOM_CONF, updated, 0o640)
                 atomic_write(CONF, assemble_config(), 0o640)
                 rc, out = validate_config()
                 if rc != 0:
@@ -1463,7 +2201,7 @@ class Panel(BaseHTTPRequestHandler):
                         atomic_write(p, data, 0o640)
                 run([SYSTEMCTL, "restart", "mihomo"])
                 return self.flash(f"重置密钥失败：{e}", False)
-        self.flash("已重置 Zashboard API 密钥，Mihomo 已重启生效。")
+        self.flash("已重置 Zashboard API 密钥，Zashboard 链接已同步更新并重启生效。")
 
     def do_cert_action(self):
         with LOCK:
@@ -1541,11 +2279,59 @@ class Panel(BaseHTTPRequestHandler):
                 return self.respond_mutation(s, f"删除服务端节点失败：{e}", False)
         return self.respond_mutation(s, f"已从服务端 proxies: 删除节点「{name}」", True)
 
+    def do_add_provider(self, s, form):
+        url = form.get("sub_url", "")
+        name = form.get("provider_name", "")
+        with LOCK:
+            try:
+                cur = load_proxy_providers()
+                prov_name, entry = build_proxy_provider(url, name, cur)
+                merged = dict(cur)
+                merged[prov_name] = entry
+                apply_proxy_providers(merged)
+            except Exception as e:
+                return self.respond_mutation(s, f"导入订阅链接失败：{e}", False)
+        return self.respond_mutation(
+            s, f"已导入订阅源「{prov_name}」（路径 {entry['path']}）到服务端 proxy-providers:", True)
+
+    def do_delete_provider(self, s, name):
+        with LOCK:
+            cur = load_proxy_providers()
+            if name not in cur:
+                return self.respond_mutation(s, "订阅源不存在或已删除", False)
+            merged = {k: v for k, v in cur.items() if k != name}
+            try:
+                apply_proxy_providers(merged)
+            except Exception as e:
+                return self.respond_mutation(s, f"删除订阅源失败：{e}", False)
+        return self.respond_mutation(s, f"已删除订阅源「{name}」", True)
+
+    def do_save_custom_config(self, s, form):
+        raw = form.get("custom_config_raw", "")
+        auto_fix = form.get("auto_fix_certs") == "1"
+        with LOCK:
+            try:
+                env = read_env()
+                if auto_fix:
+                    raw, _ = rewrite_cert_paths_in_yaml(raw, env)
+                apply_custom_config(raw)
+            except Exception as e:
+                return self.respond_mutation(s, f"更新自定义服务端配置失败：{e}", False)
+        return self.respond_mutation(s, "自定义 mihomo 服务端配置已通过校验并应用生效，面板信息已同步更新。", True)
+
+    def do_reset_template_config(self, s):
+        with LOCK:
+            try:
+                reset_to_template_config()
+            except Exception as e:
+                return self.respond_mutation(s, f"恢复默认模板失败：{e}", False)
+        return self.respond_mutation(s, "已退出自定义配置模式，恢复为内置服务端模板并重启生效。", True)
+
     # -- views & partial sections
     def login_page(self, err=""):
         e = f"<div class=err>{html.escape(err)}</div>" if err else ""
         return page(f"登录 · Clash Serve v{VERSION}", f"""<div class=login-wrap><div class=login><div class=card>
-<div class=head><div class=logo>C</div><div><h1>Clash Serve <span class='pill tag'>v{VERSION}</span></h1><p class=sub>服务器管理面板 · 请登录</p></div></div>{e}
+<div class=head><div class=logo>C</div><div><h1>Clash Serve <span class='pill tag'>v{VERSION}</span></h1><p class=sub>服务器管理控制台 · 请登录</p></div></div>{e}
 <form method=post action=/login>
 <div class=field><label for=u>用户名</label><input id=u name=username value=admin autocomplete=username required></div>
 <div class=field><label for=p>密码</label><input id=p name=password type=password autocomplete=current-password
@@ -1562,6 +2348,8 @@ placeholder="请输入面板密码" required autofocus></div>
         nodes, inbs = read_nodes(), load_inbounds()
         ports = [n["port"] for n in nodes] + [i["port"] for i in inbs]
         n_listen = sum(1 for p in ports if p in listening)
+        n_out = len(load_server_proxies())
+        n_prov = len(load_proxy_providers())
         cert = parse_cert(st["cert"].get("info", ""))
         days = cert.get("days")
         hours = cert.get("hours")
@@ -1575,10 +2363,12 @@ placeholder="请输入面板密码" required autofocus></div>
         else:
             cert_val = f"{days}<small>天</small>" if days is not None else ("未知" if cert else "缺失")
         cert_sub = f"到期 {e(cert.get('expires', ''))}" if cert.get("expires") else "证书剩余有效期"
+        mode_sub = "自定义配置模式" if is_custom_config_mode() else f"{n_out} 个节点 · {n_prov} 个订阅源"
         return "<div class=stats id=stats-bar>" + "".join([
             stat(f"<span class='dot {state_cls}'></span>内核状态", e(state_txt),
                  f"已运行 {uptime}" if uptime else "Mihomo 服务"),
-            stat("入站节点", f"{len(ports)}<small>个</small>", f"{n_listen} 个正在监听"),
+            stat("入站监听器", f"{len(ports)}<small>个</small>", f"{n_listen} 个端口正在监听"),
+            stat("服务端出站", f"{n_out + n_prov}<small>项</small>", mode_sub),
             stat("证书有效期", cert_val, cert_sub),
             stat("内核版本", e(version or "未知"), f"Clash Serve v{VERSION}"),
         ]) + "</div>"
@@ -1623,10 +2413,49 @@ placeholder="请输入面板密码" required autofocus></div>
         copy_all = (f"<div class=spacer></div><pre id=all-proxies style=display:none>{all_yaml}</pre>"
                     f"<button type=button class='btn sm' onclick=\"copyText('all-proxies',this)\">复制全部 proxies</button>"
                     if all_proxies else "")
-        body_rows = "".join(rows) or "<div class=empty>暂无入站节点，可在下方添加。</div>"
-        return f"""<div class=card id=inbounds-card><div class=card-h><h2>入站节点</h2><span class='pill gray'>共 {len(rows)} 个</span>{copy_all}
-<div class=desc>展开「查看客户端配置」可复制单个节点配置，或点击右上角复制全部节点的 proxies 片段。</div></div>
+        body_rows = "".join(rows) or "<div class=empty>暂无入站节点，可在右侧表单添加。</div>"
+        return f"""<div class=card id=inbounds-card><div class=card-h><h2>入站节点（Listeners）</h2><span class='pill gray'>共 {len(rows)} 个</span>{copy_all}
+<div class=desc>展开「查看客户端配置」可复制单个节点配置，或点击右上角复制全部节点的 proxies 片段。所有节点变更实时同步到客户端订阅。</div></div>
 <div class=list>{body_rows}</div></div>"""
+
+    def render_providers_section(self, s: dict) -> str:
+        e = html.escape
+        hid = f"<input type=hidden name=csrf value='{e(s['csrf'])}'>"
+        providers = load_proxy_providers()
+        rows = []
+        for idx, (name, cfg) in enumerate(providers.items()):
+            yml = e(dump_yaml_providers({name: cfg}).rstrip("\n"))
+            pid = f"pp-{idx}"
+            url_s = str(cfg.get("url", ""))
+            path_s = str(cfg.get("path", f"./{name}.yaml"))
+            del_form = (f"<form class=inline method=post action=/providers/delete data-ajax=1 data-busy=正在删除…>{hid}"
+                        f"<input type=hidden name=name value='{e(name)}'>"
+                        f"<button class='btn sm danger' onclick=\"return confirm('确定删除订阅源「{e(name)}」？')\">删除</button></form>")
+            rows.append(
+                f"<div class=item><div class=top><div><div class=nm>{e(name)}</div>"
+                f"<div class=meta><span>路径 <b class=mono>{e(path_s)}</b></span>"
+                f"<span>更新间隔 <b class=mono>{cfg.get('interval', 3600)}s</b></span>"
+                f"<span>URL <b class=mono>{e(url_s[:64] + ('…' if len(url_s) > 64 else ''))}</b></span></div></div>"
+                f"<span class='pill tag'>http</span>"
+                f"<div class=acts>{del_form}</div></div>"
+                f"<details><summary>查看 proxy-providers 配置</summary><pre id={pid}>{yml}</pre>"
+                f"<button type=button class='btn sm' style=margin-top:8px onclick=\"copyText('{pid}',this)\">复制</button></details></div>"
+            )
+        list_html = f"<div class=list style='margin-bottom:14px'>{''.join(rows)}</div>" if rows else ""
+        return f"""<div class=card id=providers-section>
+<div class=card-h><h2>导入外部订阅链接（<code>proxy-providers:</code>）</h2>
+<span class='pill gray'>已配置 {len(providers)} 个</span>
+<div class=desc>粘贴外部机场或自建节点订阅 URL，自动写入服务端 <code>proxy-providers:</code>（默认 <code>path: ./default.yaml</code>、<code>interval: 3600</code>、<code>proxy: DIRECT</code> 并开启 <code>gstatic 204</code> 健康检查；所有策略组已开启 <code>include-all: true</code> 自动引入）。</div></div>
+{list_html}
+<form method=post action=/providers/add data-ajax=1 data-busy=正在导入订阅…>{hid}
+<div class=form-grid>
+<div style='grid-column:span 2'><label for=sub-url-inp>订阅链接（HTTP / HTTPS URL）</label>
+<input id=sub-url-inp name=sub_url placeholder="https://example.com/sub.yaml?token=..." required></div>
+<div><label for=prov-name-inp>订阅源标识（选填）</label>
+<input id=prov-name-inp name=provider_name placeholder="留空默认写入 ./default.yaml"></div>
+</div>
+<button class='btn primary' type=submit>导入订阅到 proxy-providers</button>
+</form></div>"""
 
     def render_proxies_section(self, s: dict) -> str:
         e = html.escape
@@ -1636,12 +2465,22 @@ placeholder="请输入面板密码" required autofocus></div>
         for idx, p in enumerate(srv_proxies):
             yml = e(dump_yaml_proxies([p]).rstrip("\n"))
             pid = f"sp-{idx}"
+            if p.get("server") and p.get("port"):
+                endpoint_meta = f"<span>服务器 <b class=mono>{e(str(p['server']))}:{p['port']}</b></span>"
+            elif p.get("server"):
+                endpoint_meta = f"<span>服务器 <b class=mono>{e(str(p['server']))}</b></span>"
+            elif p.get("network-name"):
+                endpoint_meta = f"<span>网络 <b class=mono>{e(str(p['network-name']))}</b></span>"
+            elif p.get("hostname"):
+                endpoint_meta = f"<span>主机名 <b class=mono>{e(str(p['hostname']))}</b></span>"
+            else:
+                endpoint_meta = f"<span>类型 <b class=mono>{e(str(p.get('type', '')))}</b></span>"
             del_form = (f"<form class=inline method=post action=/proxies/delete data-ajax=1 data-busy=正在删除…>{hid}"
                         f"<input type=hidden name=name value='{e(p['name'])}'>"
                         f"<button class='btn sm danger' onclick=\"return confirm('确定从服务端 proxies: 删除节点「{e(p['name'])}」？')\">删除</button></form>")
             p_rows.append(
                 f"<div class=item><div class=top><div><div class=nm>{e(p['name'])}</div>"
-                f"<div class=meta><span>服务器 <b class=mono>{e(str(p['server']))}:{p['port']}</b></span>"
+                f"<div class=meta>{endpoint_meta}"
                 f"<span>UDP <b class=mono>{'开启' if p.get('udp', True) else '关闭'}</b></span></div></div>"
                 f"<span class='pill tag'>{e(str(p['type']))}</span>"
                 f"<div class=acts>{del_form}</div></div>"
@@ -1649,18 +2488,55 @@ placeholder="请输入面板密码" required autofocus></div>
                 f"<button type=button class='btn sm' style=margin-top:8px onclick=\"copyText('{pid}',this)\">复制</button></details></div>"
             )
         list_html = f"<div class=list style='margin-bottom:14px'>{''.join(p_rows)}</div>" if p_rows else ""
-        return f"""<div class=sub-sec id=proxies-section>
-<div class=card-h style='margin-bottom:10px'><h2 style='font-size:15px'>服务端出站节点（<code>proxies:</code>）</h2>
+        return f"""<div class=card id=proxies-section>
+<div class=card-h><h2>服务端手工出站节点（<code>proxies:</code>）</h2>
 <span class='pill gray'>已添加 {len(srv_proxies)} 个</span>
-<div class=desc>支持粘贴单行 JSON 或多行 YAML 格式的 mihomo 节点配置（或选择节点配置文件），面板会自动转换为多行 YAML 追加到服务端 <code>proxies:</code> 下并默认开启 <code>udp: true</code>（所有策略组已开启 <code>include-all: true</code>，可在 Zashboard 中直接选用）。</div></div>
+<div class=desc>支持粘贴单行 JSON / YAML Flow 或多行 YAML 格式的 mihomo 节点配置（包含 <code>easytier</code>、<code>tailscale</code>、<code>vless</code>、<code>ss</code> 等任意协议及连字符/点号字段），自动转换为多行 YAML 追加到服务端 <code>proxies:</code> 下并默认开启 <code>udp: true</code>。</div></div>
 {list_html}
 <form method=post action=/proxies/add data-ajax=1 data-busy=正在写入配置…>{hid}
 <div style='margin-bottom:10px'>
-<textarea id=proxies-raw name=proxies_raw placeholder='支持粘贴单行 JSON 或多行 YAML，例如：&#10;- {{"name":"HK-01","type":"vless","server":"1.2.3.4","port":443,"uuid":"...","tls":true,"reality-opts":{{"public-key":"...","short-id":"..."}}}}&#10;或：&#10;- name: HK-01&#10;  type: ss&#10;  server: 1.2.3.4&#10;  port: 8388&#10;  cipher: aes-128-gcm&#10;  password: xxx'></textarea>
+<textarea id=proxies-raw name=proxies_raw placeholder='支持粘贴单行 JSON / Flow 或多行 YAML，例如：&#10;{{"name":"Grok|EasyTier","type":"easytier","network-name":"jared","network-secret":"...","peers":["tcp://..."],"exit-nodes":["10.144.0.2"],"state-dir":"./easytier-grok","udp":true}}&#10;或标准节点：&#10;- name: HK-01&#10;  type: ss&#10;  server: 1.2.3.4&#10;  port: 8388&#10;  cipher: aes-128-gcm&#10;  password: xxx'></textarea>
 </div>
 <div class=row>
 <button class='btn primary' type=submit>添加到服务端 proxies</button>
 <label class='btn sm' style='margin:0;cursor:pointer'>选择节点配置文件<input type=file accept='.yaml,.yml,.json,.txt' style='display:none' onchange='loadProxyFile(this)'></label>
+</div></form></div>"""
+
+    def render_custom_config_section(self, s: dict, env: dict = None) -> str:
+        e = html.escape
+        if env is None:
+            env = read_env()
+        hid = f"<input type=hidden name=csrf value='{e(s['csrf'])}'>"
+        custom_active = is_custom_config_mode()
+        try:
+            with open(CUSTOM_CONF if custom_active else CONF) as f:
+                cur_cfg = f.read()
+        except FileNotFoundError:
+            cur_cfg = assemble_config()
+        cport = get_controller_port(env)
+        secret = env.get("MIHOMO_SECRET", "")
+        mode_badge = ("<span class='pill warn'>当前：自定义配置模式</span>" if custom_active
+                      else "<span class='pill ok'>当前：标准模板模式</span>")
+        reset_btn = (f"<form class=inline method=post action=/config/reset-template data-ajax=1 data-busy=正在恢复…>{hid}"
+                     f"<button class='btn sm danger' type=submit onclick=\"return confirm('确定退出自定义配置模式并恢复为内置服务端模板？')\">恢复默认模板</button></form>"
+                     if custom_active else "")
+        return f"""<div class=card id=custom-config-section>
+<div class=card-h><h2>自定义 mihomo 服务端配置模式</h2>{mode_badge}<div class=spacer></div>{reset_btn}
+<div class=desc>您可以直接粘贴或编辑整份自备的 mihomo 服务端配置文件（<code>config.yaml</code>），校验通过后立即应用并同步更新面板。</div></div>
+<div class=notice>
+<b>⚠️ 醒目提醒：Mihomo 证书目录与相对路径说明</b><br>
+1. 本系统已将 Mihomo 运行目录（<code>-d</code>）、配置文件与证书统一收纳在 <code>/etc/clashserve</code>，证书实际位于 <code>/etc/clashserve/certs/fullchain.pem</code> 与 <code>/etc/clashserve/certs/privkey.pem</code>（相对路径即 <code>certs/fullchain.pem</code> 与 <code>certs/privkey.pem</code>）。<br>
+2. 若您的自备配置中填写了其他证书路径或相对路径，请点击下方 <b>「自动修改证书路径」</b> 按钮一键修正为本机证书路径（不会误改 Reality 的 <code>private-key</code>，并会自动填充 <code>随机端口</code> / <code>填充随机密码</code> 占位符），随后点击 <b>「更新面板」</b> 校验并生效。
+</div>
+<form method=post action=/config/custom data-ajax=1 data-busy=正在校验并更新面板…>{hid}
+<div style='margin-bottom:12px'>
+<textarea class=code-ed id=custom-config-raw name=custom_config_raw data-cport='{cport}' data-secret='{e(secret)}' placeholder="在此粘贴完整的 mihomo 服务端 YAML 配置…">{e(cur_cfg)}</textarea>
+</div>
+<div class=row>
+<button type=button class='btn warn' onclick="autoFixCertPaths()">自动修改证书路径</button>
+<button type=submit class='btn primary'>更新面板</button>
+<label class=btn style='margin:0;cursor:pointer'>从本地文件载入<input type=file accept='.yaml,.yml,.txt' style='display:none' onchange="loadFileToTextarea(this,'custom-config-raw')"></label>
+<button type=button class=btn onclick="copyText('custom-config-raw',this)">复制当前配置</button>
 </div></form></div>"""
 
     def dashboard(self, s):
@@ -1677,85 +2553,150 @@ placeholder="请输入面板密码" required autofocus></div>
 
         stats = self.render_stats_section(st)
 
-        # --- status card
-        status = f"""<div class=card><div class=card-h><h2>Mihomo 内核</h2>
-<span class='pill {state_cls}'><span class='dot {state_cls}'></span>{e(state_txt)}</span></div>
-<dl class=kv><dt>版本</dt><dd class=mono>{e(version or '未知')}</dd>
-<dt>进程 PID</dt><dd class=mono>{e(st['pid'] if st['pid'] not in ('', '0') else '—')}</dd>
-<dt>启动时间</dt><dd>{e(since or '—')}</dd>
-<dt>自动重启</dt><dd>{e(st['restarts'] or '0')} 次</dd></dl>
+        # --- Hero Command Bar (replaces oversized standalone Mihomo status card)
+        cert_btn = (f"<form class=inline method=post action=/action/cert data-busy=正在续期…>{hid}"
+                    f"<button class='btn sm'>校验证书 / 续期</button></form>")
+        hero = f"""<div class=hero-bar>
+<div class=hero-meta>
+<h1>Mihomo 核心控制台 <span class='pill {state_cls}'><span class='dot {state_cls}'></span>{e(state_txt)}</span></h1>
+<div class=hero-kv>
+<span>版本 <b class=mono>{e(version or '未知')}</b></span>
+<span>PID <b class=mono>{e(st['pid'] if st['pid'] not in ('', '0') else '—')}</b></span>
+<span>启动于 <b>{e(since or '—')}</b></span>
+<span>自动重启 <b>{e(st['restarts'] or '0')} 次</b></span>
+<span>统一目录 <code class=mono>/etc/clashserve</code></span>
+</div></div>
 <div class=row>
-<form class=inline method=post action=/action/restart data-busy=正在重启…>{hid}<button class='btn primary'>重启内核</button></form>
-<form class=inline method=post action=/action/reload data-busy=正在重载…>{hid}<button class=btn title='先校验配置，通过后再热重载'>重载配置</button></form>
+<form class=inline method=post action=/action/restart data-busy=正在重启…>{hid}<button class='btn sm primary'>重启内核</button></form>
+<form class=inline method=post action=/action/reload data-busy=正在重载…>{hid}<button class='btn sm' title='先校验配置，通过后再热重载'>重载配置</button></form>
+{cert_btn}
+<a class='btn sm' href=/>刷新状态</a>
 </div></div>"""
 
         inbounds = self.render_inbounds_section(s, env, st)
 
-        # --- add inbound form
+        # --- Add Inbound Form (14 protocols aligned with MetaCubeX wiki)
         opts = "".join(f"<option value={k}>{v}</option>" for k, v in KIND_ZH.items())
         ss_opts = "".join(f"<option value={c}>{SS_CIPHER_LABELS.get(c, c)}</option>" for c in SS_CIPHERS)
-        no_cert = "" if certs_present() else "<div class=notice>证书文件缺失，暂时无法添加 Hysteria2 / TrustTunnel（请在服务器执行 clashserver cert）。</div>"
-        add = f"""<div class=card><div class=card-h><h2>添加入站</h2></div>
+        no_cert = "" if certs_present() else "<div class=notice>证书文件缺失，暂时无法添加需要 TLS 证书的入站协议（请在服务器执行 clashserver cert）。</div>"
+        add = f"""<div class=card><div class=card-h><h2>添加入站监听器</h2><span class='pill tag'>支持 14 种协议</span>
+<div class=desc>对齐 MetaCubeX 官方 Wiki，密码 / UUID / 密钥自动随机生成，所有生成节点默认开启 <code>udp: true</code>。</div></div>
 <form method=post action=/inbounds/add data-ajax=1 data-busy=正在添加…>{hid}<div class=form-grid>
-<div><label for=kind>协议类型</label><select id=kind name=kind>{opts}</select></div>
-<div><label for=port>端口</label><input id=port name=port inputmode=numeric placeholder="留空则随机分配"></div>
-<div><label for=nm>名称</label><input id=nm name=name placeholder="留空则自动生成（默认 VlessReality）"></div>
-<div data-kind=shadowsocks><label>Shadowsocks 加密方式</label><select name=ss_cipher>{ss_opts}</select></div>
-<div data-kind=snell><label>Snell 版本</label><select name=snell_version><option value=5>v5</option><option value=4>v4</option></select></div>
-<div data-kind=trusttunnel><label>TrustTunnel 用户名</label><input name=tt_user placeholder="默认 user"></div>
-</div><button class='btn primary' type=submit>添加入站</button></form>
-<p class=hint>密码、UUID、密钥均自动随机生成，所有生成节点默认开启 <code>udp: true</code>；Hysteria2 / TrustTunnel 使用本机域名证书（与面板共用），Shadowsocks / Snell / Reality 无需证书。
-保存前会自动校验配置，校验失败会自动回滚，不影响现有节点。</p>{no_cert}</div>"""
+<div><label for=kind>入站协议类型</label><select id=kind name=kind>{opts}</select></div>
+<div><label for=port>监听端口</label><input id=port name=port inputmode=numeric placeholder="留空则随机分配空闲高端口"></div>
+<div><label for=nm>节点名称</label><input id=nm name=name placeholder="留空则自动生成（默认 VlessReality）"></div>
 
-        # --- mihomo 服务端配置 card (formerly Zashboard card)
-        zb_url = zashboard_url(env)
-        zb_connect = zashboard_connect_url(env)
+<div data-kind=vless-reality><label>Reality 伪装域名（SNI）</label><input name=reality_sni placeholder="默认 www.sc.com"></div>
+<div data-kind=shadowsocks><label>Shadowsocks 加密方式</label><select name=ss_cipher>{ss_opts}</select></div>
+<div data-kind=hysteria2><label>Salamander 混淆密码（选填）</label><input name=hy2_obfs_pw placeholder="留空不启用 obfs"></div>
+<div data-kind=snell><label>Snell 版本</label><select name=snell_version><option value=5>v5（默认）</option><option value=4>v4</option></select></div>
+<div data-kind=snell><label>Snell 混淆模式</label><select name=snell_obfs><option value=tls>tls（默认）</option><option value=http>http</option></select></div>
+<div data-kind=snell><label>Snell 伪装 Host</label><input name=snell_host placeholder="默认 www.sc.com"></div>
+<div data-kind=trusttunnel><label>TrustTunnel 用户名</label><input name=tt_user placeholder="默认 user"></div>
+<div data-kind=trusttunnel><label>拥塞控制算法</label><select name=tt_cc><option value=bbr>bbr（默认）</option><option value=cubic>cubic</option></select></div>
+
+<div data-kind=vless><label>VLESS 传输层</label><select name=vless_net><option value=tcp>TCP + Vision（默认）</option><option value=xhttp>XHTTP（推荐抗封锁）</option><option value=ws>WebSocket (WS)</option><option value=grpc>gRPC</option></select></div>
+<div data-kind=vless><label>VLESS TLS 证书</label><select name=vless_tls><option value=1>启用本机域名证书（默认）</option><option value=0>不启用 TLS（配合原生加密）</option></select></div>
+<div data-kind=vless><label>VLESS 原生加密（decryption）</label><select name=vless_enc><option value=none>不启用（默认）</option><option value=x25519>启用 mlkem768x25519plus</option></select></div>
+<div data-kind=vless><label>XHTTP / WS / gRPC 路径</label><input name=vless_path placeholder="留空自动生成随机路径"></div>
+
+<div data-kind=vmess><label>VMess 传输层</label><select name=vmess_net><option value=ws>WebSocket (WS，默认)</option><option value=tcp>TCP</option><option value=grpc>gRPC</option></select></div>
+<div data-kind=vmess><label>VMess TLS 证书</label><select name=vmess_tls><option value=1>启用本机域名证书（默认）</option><option value=0>不启用 TLS</option></select></div>
+<div data-kind=vmess><label>WS 路径 / gRPC 服务名</label><input name=vmess_path placeholder="留空自动生成随机路径"></div>
+
+<div data-kind=anytls><label>AnyTLS 用户名</label><input name=anytls_user placeholder="默认 user"></div>
+<div data-kind=anytls><label>客户端 TLS 指纹</label><select name=anytls_fp><option value=chrome>chrome（默认）</option><option value=safari>safari</option><option value=firefox>firefox</option><option value=ios>ios</option></select></div>
+<div data-kind=anytls><label>Padding 填充方案</label><select name=anytls_padding><option value=1>启用默认 Padding Scheme</option><option value=0>不启用</option></select></div>
+
+<div data-kind=tuic><label>TUIC v5 拥塞控制</label><select name=tuic_cc><option value=bbr>bbr（默认）</option><option value=cubic>cubic</option><option value=new_reno>new_reno</option></select></div>
+<div data-kind=tuic><label>UDP 转发模式</label><select name=tuic_udp_mode><option value=native>native（默认）</option><option value=quic>quic</option></select></div>
+
+<div data-kind=shadowquic><label>ShadowQUIC 用户名</label><input name=sq_user placeholder="默认 user"></div>
+<div data-kind=shadowquic><label>JLS 回源伪装地址</label><input name=sq_jls placeholder="默认 www.microsoft.com:443"></div>
+<div data-kind=shadowquic><label>拥塞控制算法</label><select name=sq_cc><option value=bbr>bbr（默认）</option><option value=cubic>cubic</option><option value=new_reno>new_reno</option></select></div>
+<div data-kind=shadowquic><label>0-RTT 握手</label><select name=sq_zero_rtt><option value=1>开启（默认）</option><option value=0>关闭</option></select></div>
+
+<div data-kind=mieru><label>Mieru 传输协议</label><select name=mieru_transport><option value=TCP>TCP（默认）</option><option value=UDP>UDP</option></select></div>
+<div data-kind=mieru><label>Mieru 用户名</label><input name=mieru_user placeholder="默认 user"></div>
+
+<div data-kind=sudoku><label>Sudoku AEAD 加密</label><select name=sudoku_aead><option value=chacha20-poly1305>chacha20-poly1305（默认）</option><option value=aes-128-gcm>aes-128-gcm</option><option value=none>none</option></select></div>
+<div data-kind=sudoku><label>Sudoku 编码表类型</label><select name=sudoku_table><option value=prefer_ascii>prefer_ascii（默认）</option><option value=prefer_entropy>prefer_entropy</option><option value=up_ascii_down_entropy>up_ascii_down_entropy</option><option value=up_entropy_down_ascii>up_entropy_down_ascii</option></select></div>
+<div data-kind=sudoku><label>纯净下行（Pure Downlink）</label><select name=sudoku_pure_downlink><option value=1>开启（默认）</option><option value=0>关闭</option></select></div>
+
+<div data-kind=http><label>HTTP 用户名</label><input name=http_user placeholder="默认 user"></div>
+<div data-kind=http><label>HTTP 密码</label><input name=http_pass placeholder="留空自动生成随机密码"></div>
+<div data-kind=http><label>启用 HTTPS (TLS)</label><select name=http_tls><option value=0>不启用（默认）</option><option value=1>启用本机域名证书</option></select></div>
+
+<div data-kind=socks><label>SOCKS5 用户名</label><input name=socks_user placeholder="默认 user"></div>
+<div data-kind=socks><label>SOCKS5 密码</label><input name=socks_pass placeholder="留空自动生成随机密码"></div>
+<div data-kind=socks><label>启用 TLS</label><select name=socks_tls><option value=0>不启用（默认）</option><option value=1>启用本机域名证书</option></select></div>
+</div><button class='btn primary' type=submit>添加入站节点</button></form>
+<p class=hint>保存前会自动运行 <code>mihomo -t</code> 校验配置，校验失败自动回滚，不影响现有运行中的节点。</p>{no_cert}</div>"""
+
+        # --- Subscription URL card
+        url = self.sub_url()
+        if url:
+            sub = f"""<div class=card><div class=card-h><h2>客户端订阅链接</h2><span class='pill tag'>mihomo.yaml</span>
+<div class=desc>包含全部入站节点（含完整 Fake-IP DNS、Sniffer 与分流规则组：🚀 节点选择 → 🤖 AI → 📱 社交媒体 → 🇨🇳 中国 → 🐟 漏网之鱼）。链接即凭证，泄露后执行 <code>clashserver reset-sub</code> 更换。</div></div>
+<div class=sub-box><div class='url mono' id=sub-url>{e(url)}</div>
+<a class=btn href='{e(url)}' target=_blank rel=noopener>预览订阅</a>
+<button type=button class='btn primary' onclick="copyText('sub-url',this)">复制订阅链接</button></div></div>"""
+        else:
+            sub = ""
+
+        # --- mihomo 服务端配置 card (Zashboard URL with Secret appended + 打开地址 before 复制地址)
+        zb_full_url = zashboard_url(env)
         zb_secret = env.get("MIHOMO_SECRET", "")
         srv_cfg_url = server_config_url(env, self.cfg)
-        cport = int(env.get("CONTROLLER_PORT") or 7896)
-        zb_state = ("<span class='pill ok'><span class='dot ok'></span>监听中</span>" if cport in listening
-                    else "<span class='pill warn'>未监听</span>")
-        open_cfg = f"<a class='btn sm' href='/config/server.yaml' target=_blank rel=noopener>查看运行配置 ↗</a>"
-        open_zb = (f"<a class='btn sm primary' href='{e(zb_connect)}' target=_blank rel=noopener>打开 Zashboard ↗</a>"
-                   if zb_connect else "")
+        cport = get_controller_port(env)
+        zb_state = ("<span class='pill ok'><span class='dot ok'></span>控制端口 :" + str(cport) + " 监听中</span>"
+                    if cport in listening else f"<span class='pill warn'>控制端口 :{cport} 未监听</span>")
         reset_zb = (f"<form class=inline method=post action=/action/reset-secret data-busy=正在重置…>"
-                    f"{hid}<button class='btn sm' onclick=\"return confirm('确定重置 Zashboard API 密钥？重置后需使用新密钥连接。')\">重置 API 密钥</button></form>")
-        proxies_sec = self.render_proxies_section(s)
-        server_card = f"""<div class=card><div class=card-h><h2>mihomo 服务端配置</h2>{zb_state}<div class=spacer></div>{open_cfg}{open_zb}{reset_zb}
-<div class=desc>管理 Mihomo 服务端运行配置、Zashboard 控制面板（external-controller-tls :{cport}）与服务端出站节点（<code>proxies:</code>）。</div></div>
-<div style=margin-bottom:12px><label>当前运行中的服务端配置链接（需面板登录鉴权）</label>
+                    f"{hid}<button class='btn sm' onclick=\"return confirm('确定重置 Zashboard API 密钥？重置后需使用新链接连接。')\">重置 API 密钥</button></form>")
+        server_card = f"""<div class=card><div class=card-h><h2>mihomo 服务端配置</h2>{zb_state}<div class=spacer></div>{reset_zb}
+<div class=desc>管理 Mihomo 服务端运行配置与 Zashboard 控制面板（随机高端口 <code>:{cport}</code>，API Secret 已自动拼接到地址末尾，支持一键免填直连）。</div></div>
+<div style=margin-bottom:14px><label>Zashboard HTTPS 地址（已包含 API Secret 免填直连参数）</label>
+<div class=sub-box><div class='url mono' id=zb-url>{e(zb_full_url or '—')}</div>
+<a class='btn primary' id=zb-open-btn href='{e(zb_full_url or "#")}' target=_blank rel=noopener>打开地址</a>
+<button type=button class=btn onclick="copyText('zb-url',this)">复制地址</button></div></div>
+<div style=margin-bottom:14px><label>当前运行中的服务端配置链接（需面板登录鉴权）</label>
 <div class=sub-box><div class='url mono' id=srv-cfg-url>{e(srv_cfg_url)}</div>
 <a class=btn href='/config/server.yaml' target=_blank rel=noopener>打开配置</a>
 <button type=button class=btn onclick="copyText('srv-cfg-url',this)">复制链接</button></div></div>
-<div style=margin-bottom:12px><label>Zashboard HTTPS 地址</label>
-<div class=sub-box><div class='url mono' id=zb-url>{e(zb_url or '—')}</div>
-<button type=button class=btn onclick="copyText('zb-url',this)">复制地址</button></div></div>
-<div><label>API 密钥（Secret）</label>
+<div><label>API 密钥（Secret，已拼入上方 Zashboard 地址）</label>
 <div class=sub-box><div class='url mono' id=zb-secret>{e(zb_secret or '—')}</div>
 <button type=button class=btn onclick="copyText('zb-secret',this)">复制密钥</button></div></div>
-{proxies_sec}</div>"""
+</div>"""
 
-        url = self.sub_url()
-        if url:
-            sub = f"""<div class=card><div class=card-h><h2>订阅链接</h2><span class='pill tag'>mihomo.yaml</span>
-<div class=desc>包含全部节点，导入 mihomo / Clash 客户端即可。链接即凭证，请勿外泄；如需更换，在服务器执行 <code>clashserver reset-sub</code>。</div></div>
-<div class=sub-box><div class='url mono' id=sub-url>{e(url)}</div>
-<button type=button class='btn primary' onclick="copyText('sub-url',this)">复制链接</button></div></div>"""
-        else:
-            sub = ""
+        providers_sec = self.render_providers_section(s)
+        proxies_sec = self.render_proxies_section(s)
+        custom_cfg_sec = self.render_custom_config_section(s, env)
+
+        # --- Navigation Tabs
+        nav = """<div class=nav-tabs>
+<button type=button class='tab-btn active' data-tab=inbounds onclick="switchTab('inbounds',this)">📡 入站与客户端订阅</button>
+<button type=button class='tab-btn' data-tab=outbounds onclick="switchTab('outbounds',this)">🌐 服务端出站与订阅源</button>
+<button type=button class='tab-btn' data-tab=server onclick="switchTab('server',this)">⚙️ mihomo 服务端配置 &amp; 自定义配置</button>
+<div class=spacer></div>
+<button type=button class='btn sm' id=toggle-all-btn onclick="toggleAllTabs(this)">展开全部视图</button>
+</div>"""
+
+        tab_inbounds = f"<div class='tab-pane active' id=tab-inbounds>{sub}<div class=split-2>{inbounds}{add}</div></div>"
+        tab_outbounds = f"<div class=tab-pane id=tab-outbounds>{providers_sec}{proxies_sec}</div>"
+        tab_server = f"<div class=tab-pane id=tab-server>{server_card}{custom_cfg_sec}</div>"
+
         icon = "✓" if ok else "!"
         fl_inner = f"<div class='flash {'ok' if ok else 'bad'}'><b>{icon}</b><div>{e(msg)}</div></div>" if msg else ""
         fl = f"<div id=flash-box>{fl_inner}</div>"
         vps = env.get("VPS_NAME", "")
         top = f"""<div class=topbar><div class=in><div class=logo>C</div>
-<div class=brand><b>Clash Serve <span class='pill tag'>v{VERSION}</span></b><small>服务器管理面板 · {VERSION}</small></div>
-<span class='chip hide-sm'><span class='dot {state_cls}'></span>{e(vps or env.get('DOMAIN', ''))}</span><div class=spacer></div>
+<div class=brand><b>Clash Serve <span class='pill tag'>v{VERSION}</span></b><small>Mihomo 服务端管理控制台 · v{VERSION}</small></div>
+<span class='chip hide-sm'><span class='dot {state_cls}'></span>{e(vps or env.get('DOMAIN', ''))}</span>
+<span class='chip hide-sm'>{e(env.get('DOMAIN', ''))}</span><div class=spacer></div>
 <form class=inline method=post action=/logout>{hid}<button class='btn sm ghost'>退出登录</button></form></div></div>"""
-        head = f"""<div class=page-h><div><h1>控制台 <span class='pill gray'>v{VERSION}</span></h1><p>{e(env.get('DOMAIN', ''))}</p></div>
-<a class='btn sm' href=/>刷新</a></div>"""
-        foot = f"<footer>Clash Serve v{VERSION} · Mihomo 服务端管理面板</footer>"
+        foot = f"<footer>Clash Serve v{VERSION} · 统一目录 /etc/clashserve · Mihomo 服务端管理控制台</footer>"
         return page(f"控制台 · Clash Serve v{VERSION}",
-                    f"{top}<main>{fl}{head}{stats}{status}{server_card}{sub}{inbounds}{add}</main>{foot}",
+                    f"{top}<main>{fl}{hero}{stats}{nav}{tab_inbounds}{tab_outbounds}{tab_server}</main>{foot}",
                     scripts=True)
 
 
@@ -1809,13 +2750,20 @@ class TLSServer(ThreadingHTTPServer):
 
 
 def serve(cfg_path):
+    ensure_unified_root()
+    if not os.path.isfile(cfg_path) and os.path.isfile(CS_ROOT + "/panel.json"):
+        cfg_path = CS_ROOT + "/panel.json"
     with open(cfg_path) as f:
         cfg = json.load(f)
     Panel.cfg = cfg
     Panel.cfg_path = cfg_path
     addr = (cfg.get("listen", "0.0.0.0"), int(cfg.get("port", 8443)))
     if cfg.get("tls_cert"):
-        httpd = TLSServer(addr, Panel, ROOT + cfg["tls_cert"], ROOT + cfg["tls_key"])
+        cert_p = ROOT + cfg["tls_cert"]
+        key_p = ROOT + cfg["tls_key"]
+        if not os.path.isfile(cert_p) and os.path.isfile(ROOT + CERT):
+            cert_p, key_p = ROOT + CERT, ROOT + KEY
+        httpd = TLSServer(addr, Panel, cert_p, key_p)
         scheme = "https"
     else:   # local development only
         httpd = ThreadingHTTPServer(addr, Panel)

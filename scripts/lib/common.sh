@@ -1,25 +1,28 @@
 # shellcheck shell=bash
-# clashserver 公共函数：常量、日志、交互、环境持久化、下载与安装文件
+# clashserver 公共函数：常量、日志、交互、环境持久化、下载与安装文件、旧目录迁移
 
-CS_VERSION=0.4
+CS_VERSION=0.5
 REPO_TARBALL=https://github.com/saulsburyroy/clashserver/archive/refs/heads/main.tar.gz
+CS_ROOT=/etc/clashserve
 SELF_BIN=/usr/local/bin/clashserver
-BIN=/usr/local/bin/mihomo
-CONF_DIR=/etc/mihomo
+BIN=$CS_ROOT/mihomo
+CONF_DIR=$CS_ROOT
 CONF=$CONF_DIR/config.yaml
-STATE=$CONF_DIR/nodes.tsv          # name port uuid private pub shortid sni
-FRAG_CONTROLLER=$CONF_DIR/controller.yaml   # external-controller-tls + zashboard (cert modes)
+STATE=$CONF_DIR/nodes.tsv                    # name port uuid private pub shortid sni
+FRAG_CONTROLLER=$CONF_DIR/controller.yaml    # external-controller-tls + zashboard (cert modes)
 FRAG_REALITY=$CONF_DIR/listeners.reality.yaml
-FRAG_EXTRA=$CONF_DIR/listeners.extra.yaml   # owned by the panel
-FRAG_PROXIES=$CONF_DIR/proxies.extra.yaml   # outbound proxies owned by the panel
-CLIENT_DIR=/root/clashserver-client
+FRAG_EXTRA=$CONF_DIR/listeners.extra.yaml    # owned by the panel
+FRAG_PROXIES=$CONF_DIR/proxies.extra.yaml    # outbound proxies owned by the panel
+FRAG_PROVIDERS=$CONF_DIR/providers.extra.yaml # outbound proxy-providers owned by the panel
+CUSTOM_CONF=$CONF_DIR/custom_config.yaml     # user-supplied full server config (custom mode)
+CLIENT_DIR=$CS_ROOT/client
 UNIT=/etc/systemd/system/mihomo.service
-LIB_DIR=/usr/local/lib/clashserver
-CS_ETC=/etc/clashserver
+LIB_DIR=$CS_ROOT
+CS_ETC=$CS_ROOT
 ENV_FILE=$CS_ETC/clashserver.env
 PANEL_CFG=$CS_ETC/panel.json
-ACME_HOME=$CS_ETC/acme.sh          # acme.sh 安装目录（--home），账户与证书都在这里
-ACMESH_VERSION=3.1.6               # 固定版本，避免上游参数变动
+ACME_HOME=$CS_ETC/acme.sh                    # acme.sh 安装目录（--home），账户与证书都在这里
+ACMESH_VERSION=3.1.6                         # 固定版本，避免上游参数变动
 REPO_API=https://api.github.com/repos/MetaCubeX/mihomo/releases/latest
 REALITY_SNI=www.sc.com
 DOMAIN_RE='^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$'
@@ -28,7 +31,7 @@ WILDCARD_DOMAIN_RE='^(\*\.)?([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$'
 MODE=no-cert MODE_SET=0 NODES=1 VPS_NAME="" SERVER_IP=""   # NODES：默认生成 1 个 Reality 节点，更多节点在面板添加
 CERT_MODE=port CERT_MODE_SET=0 CF_TOKEN=""                 # CERT_MODE：port（端口模式）| dns（DNS API 模式）| manual（手动证书模式）
 DOMAIN="" EMAIL="" TLS=staging PANEL_PORT=""               # 默认 Let's Encrypt staging（仅自动申请）；面板端口随机选空闲高端口
-CONTROLLER_PORT=7896 MIHOMO_SECRET=""                      # Mihomo external-controller-tls + zashboard 端口与密钥
+CONTROLLER_PORT="" MIHOMO_SECRET=""                        # Mihomo external-controller-tls + zashboard 随机空闲高端口与密钥
 PANEL_PASS="" PANEL_HASH="" SUB_TOKEN="" WARNINGS=()
 STEP=0; TOTAL=8
 
@@ -68,7 +71,78 @@ arch() {
   esac
 }
 
+# ------------------------------------------------------------ legacy migration (/etc/mihomo, /etc/clashserver, etc. -> /etc/clashserve)
+migrate_legacy_paths() {
+  install -d -m 775 -o root -g mihomo "$CS_ROOT" 2>/dev/null || install -d -m 775 "$CS_ROOT"
+  install -d -m 700 "$CLIENT_DIR"
+
+  # 1. /usr/local/lib/clashserver -> /etc/clashserve
+  if [[ -d /usr/local/lib/clashserver && ! -L /usr/local/lib/clashserver ]]; then
+    cp -rn /usr/local/lib/clashserver/. "$CS_ROOT/" 2>/dev/null || true
+    rm -rf /usr/local/lib/clashserver
+    ln -sfn "$CS_ROOT" /usr/local/lib/clashserver
+  fi
+
+  # 2. /etc/clashserver -> /etc/clashserve
+  if [[ -d /etc/clashserver && ! -L /etc/clashserver ]]; then
+    cp -a /etc/clashserver/. "$CS_ROOT/" 2>/dev/null || true
+    rm -rf /etc/clashserver
+    ln -sfn "$CS_ROOT" /etc/clashserver
+  fi
+
+  # 3. /etc/mihomo -> /etc/clashserve
+  if [[ -d /etc/mihomo && ! -L /etc/mihomo ]]; then
+    cp -a /etc/mihomo/. "$CS_ROOT/" 2>/dev/null || true
+    rm -rf /etc/mihomo
+    ln -sfn "$CS_ROOT" /etc/mihomo
+  fi
+
+  # 4. /var/lib/mihomo -> /etc/clashserve
+  if [[ -d /var/lib/mihomo && ! -L /var/lib/mihomo ]]; then
+    cp -rn /var/lib/mihomo/. "$CS_ROOT/" 2>/dev/null || true
+    rm -rf /var/lib/mihomo
+    ln -sfn "$CS_ROOT" /var/lib/mihomo
+  fi
+
+  # 5. /root/clashserver-client -> /etc/clashserve/client
+  if [[ -d /root/clashserver-client && ! -L /root/clashserver-client ]]; then
+    cp -a /root/clashserver-client/. "$CLIENT_DIR/" 2>/dev/null || true
+    rm -rf /root/clashserver-client
+    ln -sfn "$CLIENT_DIR" /root/clashserver-client
+  fi
+
+  # 6. /usr/local/bin/mihomo -> /etc/clashserve/mihomo
+  if [[ -f /usr/local/bin/mihomo && ! -L /usr/local/bin/mihomo ]]; then
+    mv -f /usr/local/bin/mihomo "$BIN"
+    chmod 755 "$BIN"
+    ln -sfn "$BIN" /usr/local/bin/mihomo
+  elif [[ -x $BIN && ! -e /usr/local/bin/mihomo ]]; then
+    ln -sfn "$BIN" /usr/local/bin/mihomo
+  fi
+
+  # 7. Rewrite old certificate / acme paths in migrated config files
+  local f
+  for f in "$PANEL_CFG" "$CONF" "$FRAG_CONTROLLER" "$FRAG_EXTRA" "$CS_ROOT/inbounds.json"; do
+    [[ -f $f ]] || continue
+    if grep -q '/etc/mihomo/certs/' "$f" 2>/dev/null; then
+      sed -i 's|/etc/mihomo/certs/|/etc/clashserve/certs/|g' "$f" 2>/dev/null || true
+    fi
+  done
+  for f in "$ACME_HOME"/*/*.conf "$ACME_HOME"/account.conf; do
+    [[ -f $f ]] || continue
+    sed -i \
+      -e 's|/etc/clashserver/acme.sh|/etc/clashserve/acme.sh|g' \
+      -e 's|/usr/local/lib/clashserver/scripts/certctl.sh|/etc/clashserve/scripts/certctl.sh|g' \
+      "$f" 2>/dev/null || true
+  done
+
+  if [[ -x $CS_ROOT/scripts/cmd/clashserver.sh ]]; then
+    ln -sfn "$CS_ROOT/scripts/cmd/clashserver.sh" "$SELF_BIN"
+  fi
+}
+
 load_env() { # persisted install settings; CLI flags given this run win
+  migrate_legacy_paths
   [[ -r $ENV_FILE ]] || return 0
   local k v
   while IFS='=' read -r k v; do
@@ -82,7 +156,7 @@ load_env() { # persisted install settings; CLI flags given this run win
 }
 
 save_env() {
-  install -d -m 755 "$CS_ETC"
+  install -d -m 775 "$CS_ROOT"
   umask 077
   cat > "$ENV_FILE" <<EOF
 MODE="$MODE"
@@ -116,7 +190,7 @@ svc_state() {
   esac
 }
 
-require_installed() { [[ -f $STATE ]] || die "尚未安装，请先运行一键安装命令"; }
+require_installed() { migrate_legacy_paths; [[ -f $STATE ]] || die "尚未安装，请先运行一键安装命令"; }
 
 require_panel() { [[ $MODE == auto-cert && -f $PANEL_CFG ]] || die "该功能仅在自动证书或手动证书模式下提供（当前：无证书模式）"; }
 
@@ -158,15 +232,24 @@ fetch_repo() { # 下载公开仓库 main 分支到目录 $1（直连 GitHub，�
   [[ -f $1/install.sh && -f $1/scripts/cmd/clashserver.sh ]] || { rm -rf "$1"; die "下载的文件不完整"; }
 }
 
-install_files() { # 把源码树 $CS_HOME 安装到 $LIB_DIR（先写新目录再整体替换），并把 clashserver 命令链接进 PATH
-  local new=$LIB_DIR.new d
-  rm -rf "$new"; install -d -m 755 "$new"
-  for d in install.sh uninstall.sh panel resources scripts; do cp -r "$CS_HOME/$d" "$new/"; done
-  rm -rf "$new/panel/__pycache__"
-  chmod 755 "$new/install.sh" "$new/uninstall.sh" "$new/scripts/cmd/clashserver.sh" "$new/scripts/certctl.sh" "$new/panel/panel.py"
-  rm -rf "$LIB_DIR.old"
-  if [[ -d $LIB_DIR ]]; then mv "$LIB_DIR" "$LIB_DIR.old"; fi
-  mv "$new" "$LIB_DIR"
-  rm -rf "$LIB_DIR.old"
-  ln -sfn "$LIB_DIR/scripts/cmd/clashserver.sh" "$SELF_BIN"
+install_files() { # 把源码树 $CS_HOME 安装到统一目录 /etc/clashserve（保留已有配置/证书/内核），并建立兼容软链
+  migrate_legacy_paths
+  install -d -m 775 "$CS_ROOT"
+  local stage=$CS_ROOT/.stage.$$ d
+  rm -rf "$stage"; install -d -m 755 "$stage"
+  for d in install.sh uninstall.sh panel resources scripts; do cp -r "$CS_HOME/$d" "$stage/"; done
+  rm -rf "$stage/panel/__pycache__"
+  chmod 755 "$stage/install.sh" "$stage/uninstall.sh" "$stage/scripts/cmd/clashserver.sh" "$stage/scripts/certctl.sh" "$stage/panel/panel.py"
+  for d in install.sh uninstall.sh panel resources scripts; do
+    rm -rf "$CS_ROOT/$d.old"
+    if [[ -e $CS_ROOT/$d ]]; then mv "$CS_ROOT/$d" "$CS_ROOT/$d.old"; fi
+    mv "$stage/$d" "$CS_ROOT/$d"
+    rm -rf "$CS_ROOT/$d.old"
+  done
+  rm -rf "$stage"
+  ln -sfn "$CS_ROOT/scripts/cmd/clashserver.sh" "$SELF_BIN"
+  [[ -e /etc/mihomo ]] || ln -sfn "$CS_ROOT" /etc/mihomo
+  [[ -e /etc/clashserver ]] || ln -sfn "$CS_ROOT" /etc/clashserver
+  [[ -e /usr/local/lib/clashserver ]] || ln -sfn "$CS_ROOT" /usr/local/lib/clashserver
+  [[ -e /root/clashserver-client ]] || ln -sfn "$CLIENT_DIR" /root/clashserver-client
 }

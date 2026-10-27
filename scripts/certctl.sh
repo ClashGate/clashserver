@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # clashserver 证书管理（自动证书模式，acme.sh）
-#   certctl.sh issue    申请证书并部署到 /etc/mihomo/certs（安装时调用）
+#   certctl.sh issue    申请证书并部署到 /etc/clashserve/certs（安装时调用）
 #   certctl.sh renew    续期（acme.sh --cron）；首次申请未成功时重新申请（systemd timer / clashserver cert 调用）
 #   certctl.sh deploy   acme.sh 签发 / 续期后的 reloadcmd：复制证书给 Mihomo 与面板，有变化时按需重启 Mihomo
 #   certctl.sh selfsign 写入临时自签证书（正式证书申请失败时兜底，让面板和 Mihomo 先跑起来）
@@ -12,16 +12,18 @@
 #   staging     Let's Encrypt 测试证书（默认）
 #   production  Let's Encrypt 正式证书
 #   internal    本机自签证书（开发用，不走 ACME）
-# 部署结果：/etc/mihomo/certs/{fullchain,privkey}.pem（root:mihomo 0640），Mihomo 入站与面板共用。
+# 部署结果：/etc/clashserve/certs/{fullchain,privkey}.pem（root:mihomo 0640），Mihomo 入站与面板共用。
 # 退出码：0 = 证书已就绪，1 = 失败。
 set -Eeuo pipefail
 
-ENV_FILE=/etc/clashserver/clashserver.env
-ACME_HOME=/etc/clashserver/acme.sh     # acme.sh 程序、账户与证书（--home）
-LIVE=$ACME_HOME/live                     # acme.sh 安装证书的位置（--fullchain-file / --key-file）
-SELF=/usr/local/lib/clashserver/scripts/certctl.sh
-DEST=/etc/mihomo/certs
-MIHOMO_CONF=/etc/mihomo/config.yaml
+CS_ROOT=/etc/clashserve
+ENV_FILE=$CS_ROOT/clashserver.env
+[[ -r $ENV_FILE || ! -r /etc/clashserver/clashserver.env ]] || ENV_FILE=/etc/clashserver/clashserver.env
+ACME_HOME=$CS_ROOT/acme.sh             # acme.sh 程序、账户与证书（--home）
+LIVE=$ACME_HOME/live                   # acme.sh 安装证书的位置（--fullchain-file / --key-file）
+SELF=$CS_ROOT/scripts/certctl.sh
+DEST=$CS_ROOT/certs
+MIHOMO_CONF=$CS_ROOT/config.yaml
 LOCK_FILE=/run/clashserver-cert.lock
 TEMP_CN="clashserver temporary certificate"
 CA_LE=https://acme-v02.api.letsencrypt.org/directory
@@ -40,11 +42,10 @@ say() { echo "certctl: $*"; }
 err() { echo "certctl: $*" >&2; }
 trap 'err "第 $LINENO 行执行失败：$BASH_COMMAND"' ERR
 
-# 只有 Mihomo 配置里真的引用了证书（面板添加了 Hysteria2 / TrustTunnel）才需要重启；
-# Reality / Snell 不用证书，避免每次续期都断开现有连接。面板按文件变化自动换证书，不需要重启。
+# 只有 Mihomo 配置里引用了证书才需要重启；面板按文件变化自动换证书，不需要重启。
 restart_mihomo() {
   systemctl is-active --quiet mihomo || return 0
-  grep -qF "$DEST/" "$MIHOMO_CONF" 2>/dev/null || return 0
+  grep -qE "($DEST/|/etc/mihomo/certs/|certs/)" "$MIHOMO_CONF" 2>/dev/null || return 0
   systemctl restart mihomo && say "已重启 Mihomo 以加载新证书" || err "重启 Mihomo 失败"
 }
 
@@ -73,7 +74,7 @@ deploy() { # deploy <crt> <key> -> 有变化返回 0，未变化 / 无效返回 
   say "证书已更新 -> $DEST（到期：$(openssl x509 -noout -enddate -in "$DEST/fullchain.pem" | cut -d= -f2)）"
 }
 
-deploy_live() { # acme.sh 输出 -> /etc/mihomo/certs；重复调用无副作用
+deploy_live() { # acme.sh 输出 -> /etc/clashserve/certs；重复调用无副作用
   [[ -f $LIVE/fullchain.pem && -f $LIVE/privkey.pem ]] || { err "$LIVE 中没有证书"; return 1; }
   if deploy "$LIVE/fullchain.pem" "$LIVE/privkey.pem"; then restart_mihomo; fi
   return 0
@@ -167,7 +168,7 @@ issued=0
 if [[ $ACTION == renew ]] && ((issued)) && [[ $saved_api == "$api" && $saved_webroot == "$want_webroot" ]] && ! is_temp; then
   rc=0
   acme --cron "${extra[@]}" || rc=$?
-  deploy_live || true   # 自愈：/etc/mihomo/certs 被误删 / 改动时重新部署（无变化时什么也不做）
+  deploy_live || true   # 自愈：/etc/clashserve/certs 被误删 / 改动时重新部署（无变化时什么也不做）
   ((rc == 0)) || err "续期失败；当前证书仍可用到 $(openssl x509 -noout -enddate -in "$DEST/fullchain.pem" 2>/dev/null | cut -d= -f2)"
   exit "$rc"
 fi

@@ -26,6 +26,7 @@ install_deps() {
 
 install_core() {
   log "安装最新稳定版 Mihomo 内核"
+  install -d -m 775 "$CS_ROOT"
   local a rel tag url tmp
   a=$(arch)
   rel=$(curl -fsSL --retry 3 "$REPO_API") || die "无法获取 Mihomo 版本信息（请确认服务器可以访问 GitHub）"
@@ -39,6 +40,7 @@ install_core() {
   chmod 755 "$BIN.new"
   "$BIN.new" -v >/dev/null || die "下载的 Mihomo 无法运行"
   mv "$BIN.new" "$BIN"
+  ln -sfn "$BIN" /usr/local/bin/mihomo
   info "已安装 $tag -> $BIN"
 }
 
@@ -61,7 +63,7 @@ rand_port() {
   while :; do
     p=$((RANDOM % 20000 + 20000))
     grep -q "	$p	" "$STATE" 2>/dev/null && continue
-    [[ $p == "$PANEL_PORT" || $p == "${CONTROLLER_PORT:-7896}" ]] && continue
+    [[ $p == "${PANEL_PORT:-}" || $p == "${CONTROLLER_PORT:-}" ]] && continue
     ss -ltun 2>/dev/null | grep -q ":$p " && continue
     echo "$p"; return
   done
@@ -69,8 +71,10 @@ rand_port() {
 
 ensure_user() {
   id mihomo >/dev/null 2>&1 || useradd --system --no-create-home --shell /usr/sbin/nologin mihomo
-  install -d -m 750 -o root -g mihomo "$CONF_DIR"
-  install -d -m 750 -o mihomo -g mihomo /var/lib/mihomo
+  install -d -m 775 -o root -g mihomo "$CONF_DIR"
+  install -d -m 750 -o root -g mihomo "$CONF_DIR/certs"
+  install -d -m 700 -o root -g root "$CLIENT_DIR"
+  [[ -e /var/lib/mihomo ]] || ln -sfn "$CONF_DIR" /var/lib/mihomo
 }
 
 gen_nodes() {
@@ -94,11 +98,12 @@ validate_conf() {
   local d rc=0
   d=$(mktemp -d)
   mkdir -p "$d/ui"   # 避免 mihomo -t 校验时临时下载 external-ui
-  [[ -f /var/lib/mihomo/country.mmdb ]] && ln -s /var/lib/mihomo/country.mmdb "$d/country.mmdb"
-  SAFE_PATHS=$CONF_DIR "$BIN" -t -d "$d" -f "$CONF" >/dev/null || rc=$?
-  if ((rc == 0)) && [[ -f $d/country.mmdb && ! -L $d/country.mmdb && -d /var/lib/mihomo ]]; then
-    cp -a "$d/country.mmdb" /var/lib/mihomo/country.mmdb 2>/dev/null || true
-    chown mihomo:mihomo /var/lib/mihomo/country.mmdb 2>/dev/null || true
+  [[ -d $CONF_DIR/certs ]] && ln -s "$CONF_DIR/certs" "$d/certs"
+  [[ -f $CONF_DIR/country.mmdb ]] && ln -s "$CONF_DIR/country.mmdb" "$d/country.mmdb"
+  SAFE_PATHS="$CONF_DIR:/etc/mihomo" "$BIN" -t -d "$d" -f "$CONF" >/dev/null || rc=$?
+  if ((rc == 0)) && [[ -f $d/country.mmdb && ! -L $d/country.mmdb && -d $CONF_DIR ]]; then
+    cp -a "$d/country.mmdb" "$CONF_DIR/country.mmdb" 2>/dev/null || true
+    chown mihomo:mihomo "$CONF_DIR/country.mmdb" 2>/dev/null || true
   fi
   rm -rf "$d"
   return "$rc"
@@ -106,10 +111,17 @@ validate_conf() {
 
 ensure_mihomo_secret() {
   [[ $MODE == auto-cert ]] || return 0
+  local changed=0
+  if [[ -z ${CONTROLLER_PORT:-} ]]; then
+    CONTROLLER_PORT=$(rand_port)
+    changed=1
+  fi
   if [[ -z ${MIHOMO_SECRET:-} ]]; then
     MIHOMO_SECRET=$(openssl rand -base64 32 | tr -dc 'A-Za-z0-9' | head -c 20)
-    save_env
+    changed=1
   fi
+  ((changed)) && save_env
+  return 0
 }
 
 render_controller() {
@@ -120,7 +132,7 @@ render_controller() {
         || "$LIB_DIR/scripts/certctl.sh" selfsign >/dev/null
     fi
     cat > "$FRAG_CONTROLLER" <<EOF
-external-controller-tls: "0.0.0.0:${CONTROLLER_PORT:-7896}"
+external-controller-tls: "0.0.0.0:$CONTROLLER_PORT"
 tls:
   certificate: $CONF_DIR/certs/fullchain.pem
   private-key: $CONF_DIR/certs/privkey.pem
@@ -138,13 +150,29 @@ EOF
   chmod 640 "$FRAG_CONTROLLER"; chown root:mihomo "$FRAG_CONTROLLER"
 }
 
-# config.yaml = template with @@CONTROLLER@@, @@PROXIES@@, and @@LISTENERS@@ <- reality + extra fragments.
+# config.yaml = custom_config.yaml (if active) OR template with @@CONTROLLER@@, @@PROXY_PROVIDERS@@, @@PROXIES@@, and @@LISTENERS@@.
 # Mirrors assemble_config() in panel/panel.py.
 assemble_config() {
+  if [[ -s $CUSTOM_CONF ]]; then
+    cp -f "$CUSTOM_CONF" "$CONF.new"
+    chmod 640 "$CONF.new"; chown root:mihomo "$CONF.new"
+    mv -f "$CONF.new" "$CONF"
+    return 0
+  fi
   [[ -f $FRAG_CONTROLLER ]] || render_controller
   [[ -f $FRAG_PROXIES ]] || : > "$FRAG_PROXIES"
-  awk -v c="$FRAG_CONTROLLER" -v p="$FRAG_PROXIES" -v r="$FRAG_REALITY" -v e="$FRAG_EXTRA" '
+  [[ -f $FRAG_PROVIDERS ]] || : > "$FRAG_PROVIDERS"
+  awk -v c="$FRAG_CONTROLLER" -v pv="$FRAG_PROVIDERS" -v p="$FRAG_PROXIES" -v r="$FRAG_REALITY" -v e="$FRAG_EXTRA" '
     /^@@CONTROLLER@@$/ { while ((getline l < c) > 0) print l; next }
+    /^@@PROXY_PROVIDERS@@$/ {
+      has = 0
+      while ((getline l < pv) > 0) {
+        if (l ~ /^[[:space:]]*$/) continue
+        if (!has) { print "proxy-providers:"; has = 1 }
+        print l
+      }
+      next
+    }
     /^@@PROXIES@@$/    {
       has = 0
       while ((getline l < p) > 0) {
@@ -187,8 +215,9 @@ render_server() {
   printf '%s' "$listeners" > "$FRAG_REALITY"
   [[ -f $FRAG_EXTRA ]] || : > "$FRAG_EXTRA"
   [[ -f $FRAG_PROXIES ]] || : > "$FRAG_PROXIES"
-  chmod 640 "$FRAG_REALITY" "$FRAG_EXTRA" "$FRAG_PROXIES"
-  chown root:mihomo "$FRAG_REALITY" "$FRAG_EXTRA" "$FRAG_PROXIES" "$STATE"
+  [[ -f $FRAG_PROVIDERS ]] || : > "$FRAG_PROVIDERS"
+  chmod 640 "$FRAG_REALITY" "$FRAG_EXTRA" "$FRAG_PROXIES" "$FRAG_PROVIDERS"
+  chown root:mihomo "$FRAG_REALITY" "$FRAG_EXTRA" "$FRAG_PROXIES" "$FRAG_PROVIDERS" "$STATE"
   assemble_config
   validate_conf || die "生成的服务端配置未通过校验（mihomo -t）"
 }
@@ -221,6 +250,7 @@ render_client() {
   chmod 600 "$CLIENT_DIR/mihomo-client.yaml"
   { echo "proxies:"; printf '%s' "$proxies"; } > "$CLIENT_DIR/proxies.yaml"
   chmod 600 "$CLIENT_DIR/proxies.yaml"
+  [[ -e /root/clashserver-client ]] || ln -sfn "$CLIENT_DIR" /root/clashserver-client
 }
 
 open_firewall() { # 本机启用了 ufw 时自动放行所需端口（云服务商安全组仍需自行放行）
@@ -229,7 +259,7 @@ open_firewall() { # 本机启用了 ufw 时自动放行所需端口（云服务�
   if [[ $MODE == auto-cert ]]; then
     [[ ${CERT_MODE:-port} == port ]] && ports+=(80/tcp)
     [[ $PANEL_PORT == 80 && ${CERT_MODE:-port} == port ]] || ports+=("$PANEL_PORT/tcp")
-    ports+=("${CONTROLLER_PORT:-7896}/tcp")
+    ports+=("$CONTROLLER_PORT/tcp")
   fi
   while IFS=$'\t' read -r _ p _; do ports+=("$p/tcp"); done < "$STATE"
   for p in "${ports[@]}"; do ufw allow "$p" >/dev/null 2>&1 || true; done
