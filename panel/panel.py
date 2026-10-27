@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """clashserve - minimal admin panel for clashserver (auto-cert mode).
 
-Stdlib only (Debian python3). Listens on 127.0.0.1 behind Caddy HTTPS.
-Features: admin login, Mihomo status dashboard, restart/reload, add/delete inbounds
-(vless-reality, hysteria2, snell, trusttunnel) which are written to Mihomo listeners.
+Stdlib only (Debian python3). Serves HTTPS itself with the same certificate
+Mihomo uses (/etc/mihomo/certs, issued by acme.sh); no reverse proxy.
+Features: admin login, Mihomo status dashboard, restart/reload, cert renewal,
+add/delete inbounds (vless-reality, hysteria2, snell, trusttunnel).
 
 Subcommands:
   panel.py hash-password            read password on stdin, print hash
@@ -20,6 +21,8 @@ import os
 import random
 import re
 import secrets
+import socket
+import ssl
 import subprocess
 import sys
 import tempfile
@@ -40,6 +43,7 @@ FRAG_REALITY = MIHOMO_DIR + "/listeners.reality.yaml"
 FRAG_EXTRA = MIHOMO_DIR + "/listeners.extra.yaml"
 TEMPLATE = ROOT + "/usr/local/lib/clashserver/resources/server.yaml.tpl"
 CLIENT_TEMPLATE = ROOT + "/usr/local/lib/clashserver/resources/client.yaml.tpl"
+CERTCTL = ROOT + "/usr/local/lib/clashserver/scripts/certctl.sh"
 CERT = "/etc/mihomo/certs/fullchain.pem"   # paths as seen by mihomo (not ROOT-prefixed)
 KEY = "/etc/mihomo/certs/privkey.pem"
 MIHOMO_BIN = os.environ.get("MIHOMO_BIN", "/usr/local/bin/mihomo")
@@ -143,12 +147,20 @@ def certs_present() -> bool:
     return os.path.isfile(ROOT + CERT) and os.path.isfile(ROOT + KEY)
 
 
+def panel_base_url(env: dict, cfg: dict) -> str:
+    host = env.get("DOMAIN", "").removeprefix("*.")
+    if not host:
+        return ""
+    port = int(cfg.get("port") or env.get("PANEL_PORT") or 8443)
+    return f"https://{host}" if port == 443 else f"https://{host}:{port}"
+
+
 # ---------------------------------------------------------------- inbound model
 def build_inbound(kind: str, form: dict, env: dict) -> dict:
     if kind not in TYPES:
         raise ValueError("未知的入站类型")
     if kind in CERT_TYPES and not certs_present():
-        raise ValueError(f"{kind} 需要 TLS 证书，未找到 {CERT}（请先执行 systemctl start clashserver-certsync）")
+        raise ValueError(f"{kind} 需要 TLS 证书，未找到 {CERT}（请先在服务器执行 clashserver cert）")
     port_s = form.get("port", "").strip()
     if port_s:
         if not port_s.isdigit() or not 1 <= int(port_s) <= 65535:
@@ -163,7 +175,7 @@ def build_inbound(kind: str, form: dict, env: dict) -> dict:
         raise ValueError("名称仅限 1-48 位字母、数字及 . _ -")
     vps = env.get("VPS_NAME", "vps")
     ip = env.get("SERVER_IP", "")
-    domain = env.get("DOMAIN", "")
+    domain = env.get("DOMAIN", "").removeprefix("*.")
     insecure = env.get("TLS", "") in ("staging", "internal")
     base = {"name": name, "port": port, "listen": "0.0.0.0"}
     label = f"{vps}-{name}"
@@ -455,7 +467,7 @@ STATE_ZH = {"active": ("运行中", "ok"), "inactive": ("已停止", "bad"), "fa
             "activating": ("启动中", "warn"), "deactivating": ("停止中", "warn"),
             "reloading": ("重载中", "warn"), "unknown": ("未知", "bad")}
 TLS_ZH = {"staging": ("LE 测试证书", "warn", "Let's Encrypt 测试（staging）证书不受公众信任，客户端需开启 skip-cert-verify。"),
-          "internal": ("内部 CA", "warn", "Caddy 内部 CA 自签证书，仅供开发测试，客户端需开启 skip-cert-verify。"),
+          "internal": ("自签证书", "warn", "本机自签证书，仅供开发测试，客户端需开启 skip-cert-verify。"),
           "production": ("Let's Encrypt", "ok", "")}
 KIND_ZH = {"vless-reality": "VLESS Reality", "hysteria2": "Hysteria2", "snell": "Snell",
            "trusttunnel": "TrustTunnel"}
@@ -519,13 +531,10 @@ class Panel(BaseHTTPRequestHandler):
 
     # -- utils
     def client_ip(self):
-        ip = self.client_address[0]
-        if ip in ("127.0.0.1", "::1"):
-            ip = (self.headers.get("X-Forwarded-For") or ip).split(",")[0].strip()
-        return ip
+        return self.client_address[0]   # direct HTTPS, no reverse proxy: never trust X-Forwarded-For
 
     def is_https(self):
-        return self.headers.get("X-Forwarded-Proto") == "https"
+        return bool(self.cfg.get("tls_cert"))
 
     def send(self, code, body, ctype="text/html; charset=utf-8", headers=None):
         data = body.encode() if isinstance(body, str) else body
@@ -613,6 +622,8 @@ class Panel(BaseHTTPRequestHandler):
             return self.redirect("/login", "cs_session=; Max-Age=0; Path=/")
         if path in ("/action/restart", "/action/reload"):
             return self.do_action(path.rsplit("/", 1)[1])
+        if path == "/action/cert":
+            return self.do_cert_action()
         if path == "/inbounds/add":
             return self.do_add(form)
         m = re.fullmatch(r"/inbounds/([0-9a-f]{12})/delete", path)
@@ -638,7 +649,8 @@ class Panel(BaseHTTPRequestHandler):
 
     def sub_url(self):
         token = self.cfg.get("sub_token", "")
-        return f"https://{read_env().get('DOMAIN', '')}/sub/{token}/mihomo.yaml" if token else ""
+        base = panel_base_url(read_env(), self.cfg)
+        return f"{base}/sub/{token}/mihomo.yaml" if (token and base) else ""
 
     def do_login(self, form):
         ip, now = self.client_ip(), time.time()
@@ -674,6 +686,15 @@ class Panel(BaseHTTPRequestHandler):
         else:
             self.flash(f"{zh}失败：{out[-300:]}（Mihomo 当前状态：{state}）", False)
 
+    def do_cert_action(self):
+        with LOCK:
+            rc, out = run([CERTCTL, "renew"], timeout=180)
+        if rc == 0:
+            self.flash("证书检查 / 续期完成。")
+        else:
+            tail = " | ".join(l for l in out.splitlines() if l.strip())[-300:]
+            self.flash(f"证书申请 / 续期失败：{tail}", False)
+
     def do_add(self, form):
         env = read_env()
         with LOCK:
@@ -706,7 +727,6 @@ class Panel(BaseHTTPRequestHandler):
 <div class=field><label for=p>密码</label><input id=p name=password type=password autocomplete=current-password
 placeholder="请输入面板密码" required autofocus></div>
 <button class='btn primary'>登 录</button></form>
-<div class=foot>忘记密码？在服务器上执行 <code>clashserver reset-password</code></div>
 </div></div></div>""")
 
     def dashboard(self, s):
@@ -734,7 +754,7 @@ placeholder="请输入面板密码" required autofocus></div>
         if days is not None and days < 1:
             left, cert_val = f"{hours} 小时", f"{hours}<small>小时</small>"
         else:
-            left, cert_val = f"{days} 天", (f"{days}<small>天</small>" if days is not None else ("未知" if cert else "未同步"))
+            left, cert_val = f"{days} 天", (f"{days}<small>天</small>" if days is not None else ("未知" if cert else "缺失"))
         cert_sub = f"到期 {e(cert.get('expires', ''))}" if cert.get("expires") else "证书剩余有效期"
         stats = "<div class=stats>" + "".join([
             stat(f"<span class='dot {state_cls}'></span>内核状态", e(state_txt),
@@ -758,6 +778,7 @@ placeholder="请输入面板密码" required autofocus></div>
 
         # --- tls card
         tls_txt, tls_cls, tls_hint = TLS_ZH.get(env.get("TLS", ""), (env.get("TLS", "") or "未知", "gray", ""))
+        cert_mode_zh = "DNS API 模式" if env.get("CERT_MODE") == "dns" else "端口模式"
         if cert:
             days_html = ""
             if days is not None:
@@ -766,11 +787,25 @@ placeholder="请输入面板密码" required autofocus></div>
             cert_rows = (f"<dt>颁发者</dt><dd>{e(cert.get('issuer', '—'))}</dd>"
                          f"<dt>到期时间</dt><dd>{e(cert.get('expires', '—'))}{days_html}</dd>")
         else:
-            cert_rows = "<dt>证书</dt><dd><span class='pill bad'>未同步</span></dd>"
+            cert_rows = "<dt>证书</dt><dd><span class='pill bad'>缺失</span></dd>"
+        if "clashserver temporary" in (cert or {}).get("issuer", ""):
+            tls_txt, tls_cls = "尚未签发", "bad"
+            if env.get("CERT_MODE") == "dns":
+                tls_hint = "正式证书尚未申请成功，当前为临时自签证书。请确认 Cloudflare API Token 具备该域名的 DNS 编辑权限；系统每小时自动重试，也可点击下方按钮或执行 clashserver cert 立即重试。"
+            else:
+                tls_hint = "正式证书尚未申请成功，当前为临时自签证书。请确认域名 A 记录指向本机、TCP 80 已放行；系统每小时自动重试，也可点击下方按钮或执行 clashserver cert 立即重试。"
+        elif days is not None and days < 14 and env.get("TLS", "") != "internal":
+            tls_hint = (tls_hint + " " if tls_hint else "") + (
+                "证书即将到期，自动续期尚未成功（正常情况下到期前 30 天就会续期）。"
+                "请检查配置后点击下方按钮或在服务器执行 clashserver cert 查看原因。")
         hint = f"<div class=notice>{e(tls_hint)}</div>" if tls_hint else ""
         tls = f"""<div class=card><div class=card-h><h2>域名与证书</h2><span class='pill {tls_cls}'>{e(tls_txt)}</span></div>
-<dl class=kv><dt>面板地址</dt><dd class=mono>https://{e(env.get('DOMAIN', '—'))}</dd>
-<dt>服务器 IP</dt><dd class=mono>{e(env.get('SERVER_IP', '—'))}</dd>{cert_rows}</dl>{hint}</div>"""
+<dl class=kv><dt>面板地址</dt><dd class=mono>{e(panel_base_url(env, self.cfg) or '—')}</dd>
+<dt>申请方式</dt><dd>{e(cert_mode_zh)}</dd>
+<dt>服务器 IP</dt><dd class=mono>{e(env.get('SERVER_IP', '—'))}</dd>{cert_rows}</dl>{hint}
+<div class=row style=margin-top:14px>
+<form class=inline method=post action=/action/cert data-busy=正在申请/续期…>{hid}<button class='btn sm'>立即申请 / 续期证书</button></form>
+</div></div>"""
 
         # --- inbounds list
         def state(port):
@@ -801,14 +836,19 @@ placeholder="请输入面板密码" required autofocus></div>
             rows.append(item(i["name"], i["kind"], i["port"],
                              f"<span>面板添加{(' · ' + created) if created else ''}</span>",
                              acts, f"c-{i['id']}", i["client"]))
+        all_proxies = [reality_client(n, env) for n in nodes] + [i["client"] for i in inbs]
+        all_yaml = e("proxies:\n" + "\n".join("  - " + json.dumps(p, ensure_ascii=False) for p in all_proxies))
+        copy_all = (f"<div class=spacer></div><pre id=all-proxies style=display:none>{all_yaml}</pre>"
+                    f"<button type=button class='btn sm' onclick=\"copyText('all-proxies',this)\">复制全部 proxies</button>"
+                    if all_proxies else "")
         body_rows = "".join(rows) or "<div class=empty>暂无入站节点，可在下方添加。</div>"
-        inbounds = f"""<div class=card><div class=card-h><h2>入站节点</h2><span class='pill gray'>共 {len(rows)} 个</span>
-<div class=desc>展开「查看客户端配置」可复制单个节点的 proxies 配置。</div></div>
+        inbounds = f"""<div class=card><div class=card-h><h2>入站节点</h2><span class='pill gray'>共 {len(rows)} 个</span>{copy_all}
+<div class=desc>展开「查看客户端配置」可复制单个节点配置，或点击右上角复制全部节点的 proxies 片段。</div></div>
 <div class=list>{body_rows}</div></div>"""
 
         # --- add form
         opts = "".join(f"<option value={k}>{v}</option>" for k, v in KIND_ZH.items())
-        no_cert = "" if certs_present() else "<div class=notice>尚未同步证书，暂时无法添加 Hysteria2 / TrustTunnel。</div>"
+        no_cert = "" if certs_present() else "<div class=notice>证书文件缺失，暂时无法添加 Hysteria2 / TrustTunnel（请在服务器执行 clashserver cert）。</div>"
         add = f"""<div class=card><div class=card-h><h2>添加入站</h2></div>
 <form method=post action=/inbounds/add data-busy=正在添加…>{hid}<div class=form-grid>
 <div><label for=kind>协议类型</label><select id=kind name=kind>{opts}</select></div>
@@ -817,7 +857,7 @@ placeholder="请输入面板密码" required autofocus></div>
 <div data-kind=snell><label>Snell 版本</label><select name=snell_version><option value=5>v5</option><option value=4>v4</option></select></div>
 <div data-kind=trusttunnel><label>TrustTunnel 用户名</label><input name=tt_user placeholder="默认 user"></div>
 </div><button class='btn primary'>添加入站</button></form>
-<p class=hint>密码、UUID、密钥均自动随机生成；Hysteria2 / TrustTunnel 使用已同步的证书，Snell / Reality 无需证书。
+<p class=hint>密码、UUID、密钥均自动随机生成；Hysteria2 / TrustTunnel 使用本机域名证书（与面板共用，自动续期），Snell / Reality 无需证书。
 保存前会自动校验配置，校验失败会自动回滚，不影响现有节点。</p>{no_cert}</div>"""
 
         url = self.sub_url()
@@ -842,13 +882,67 @@ placeholder="请输入面板密码" required autofocus></div>
                     scripts=True)
 
 
+class TLSServer(ThreadingHTTPServer):
+    """HTTPS server: handshake runs in the worker thread (a slow client cannot block accept),
+    and the certificate is reloaded automatically when acme.sh renews it (file mtime changes)."""
+    daemon_threads = True
+
+    def __init__(self, addr, handler, cert, key):
+        self.cert, self.key, self._stamp, self.ctx = cert, key, None, None
+        self._reload()
+        super().__init__(addr, handler)
+
+    def _reload(self):
+        try:
+            stamp = (os.stat(self.cert).st_mtime_ns, os.stat(self.key).st_mtime_ns)
+        except OSError:
+            return
+        if stamp == self._stamp:
+            return
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+        ctx.set_alpn_protocols(["http/1.1"])
+        try:
+            ctx.load_cert_chain(self.cert, self.key)
+        except (OSError, ssl.SSLError) as e:
+            sys.stderr.write(f"certificate load failed: {e}\n")
+            if self.ctx is None:
+                raise
+            return
+        self.ctx, self._stamp = ctx, stamp
+        sys.stderr.write("certificate loaded\n")
+
+    def get_request(self):
+        sock, addr = self.socket.accept()
+        self._reload()
+        sock.settimeout(30)
+        return self.ctx.wrap_socket(sock, server_side=True, do_handshake_on_connect=False), addr
+
+    def finish_request(self, request, client_address):
+        try:
+            request.do_handshake()
+        except (ssl.SSLError, OSError):
+            return   # plain HTTP / scanners / aborted handshakes: drop quietly
+        super().finish_request(request, client_address)
+
+    def handle_error(self, request, client_address):
+        if isinstance(sys.exc_info()[1], (ssl.SSLError, ConnectionError, socket.timeout)):
+            return
+        super().handle_error(request, client_address)
+
+
 def serve(cfg_path):
     with open(cfg_path) as f:
         cfg = json.load(f)
     Panel.cfg = cfg
-    addr = (cfg.get("listen", "127.0.0.1"), int(cfg.get("port", 8088)))
-    httpd = ThreadingHTTPServer(addr, Panel)
-    sys.stderr.write(f"clashserve listening on {addr[0]}:{addr[1]}\n")
+    addr = (cfg.get("listen", "0.0.0.0"), int(cfg.get("port", 8443)))
+    if cfg.get("tls_cert"):
+        httpd = TLSServer(addr, Panel, ROOT + cfg["tls_cert"], ROOT + cfg["tls_key"])
+        scheme = "https"
+    else:   # local development only
+        httpd = ThreadingHTTPServer(addr, Panel)
+        scheme = "http"
+    sys.stderr.write(f"clashserve listening on {scheme}://{addr[0]}:{addr[1]}\n")
     httpd.serve_forever()
 
 

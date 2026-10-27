@@ -5,7 +5,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-# Runs as root so it can rewrite /etc/mihomo and call systemctl; bound to 127.0.0.1 behind Caddy only.
+# Runs as root so it can rewrite /etc/mihomo and call systemctl; serves HTTPS itself with the certificate in /etc/mihomo/certs.
 ExecStart=/usr/bin/python3 /usr/local/lib/clashserver/panel/panel.py serve --config /etc/clashserver/panel.json
 Restart=on-failure
 RestartSec=3

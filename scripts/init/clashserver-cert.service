@@ -1,0 +1,8 @@
+[Unit]
+Description=clashserver: renew TLS certificate (acme.sh) for Mihomo and the panel
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/lib/clashserver/scripts/certctl.sh renew

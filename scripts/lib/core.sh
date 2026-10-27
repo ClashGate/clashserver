@@ -8,14 +8,17 @@ install_deps() {
   command -v ss >/dev/null || missing+=(iproute2)
   if [[ $MODE == auto-cert ]]; then
     command -v python3 >/dev/null || missing+=(python3)
-    command -v gpg >/dev/null || missing+=(gnupg)
+    command -v socat >/dev/null || missing+=(socat)     # acme.sh standalone 模式需要
     command -v getent >/dev/null || missing+=(libc-bin)
   fi
   if ((${#missing[@]})); then
     info "apt 安装：${missing[*]}"
-    apt-get update -qq || die "apt-get update 失败，请检查软件源和网络"
-    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "${missing[@]}" ca-certificates >/dev/null \
-      || die "依赖安装失败：${missing[*]}"
+    local i
+    for i in 1 2 3; do apt-get update -qq >/dev/null 2>&1 && break; ((i < 3)) || die "apt-get update 失败，请检查软件源和网络"; sleep 5; done
+    for i in 1 2 3; do
+      DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "${missing[@]}" ca-certificates >/dev/null 2>&1 && break
+      ((i < 3)) || die "依赖安装失败：${missing[*]}"; sleep 5
+    done
   fi
 }
 
@@ -149,6 +152,18 @@ render_client() {
   chmod 600 "$CLIENT_DIR/mihomo-client.yaml"
   { echo "proxies:"; printf '%s' "$proxies"; } > "$CLIENT_DIR/proxies.yaml"
   chmod 600 "$CLIENT_DIR/proxies.yaml"
+}
+
+open_firewall() { # 本机启用了 ufw 时自动放行所需端口（云服务商安全组仍需自行放行）
+  command -v ufw >/dev/null && ufw status 2>/dev/null | grep -q '^Status: active' || return 0
+  local p ports=()
+  if [[ $MODE == auto-cert ]]; then
+    [[ ${CERT_MODE:-port} == port ]] && ports+=(80/tcp)
+    [[ $PANEL_PORT == 80 && ${CERT_MODE:-port} == port ]] || ports+=("$PANEL_PORT/tcp")
+  fi
+  while IFS=$'\t' read -r _ p _; do ports+=("$p/tcp"); done < "$STATE"
+  for p in "${ports[@]}"; do ufw allow "$p" >/dev/null 2>&1 || true; done
+  info "检测到 ufw 已启用，已放行：${ports[*]}"
 }
 
 setup_service() {

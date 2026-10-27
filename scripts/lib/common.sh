@@ -15,17 +15,17 @@ LIB_DIR=/usr/local/lib/clashserver
 CS_ETC=/etc/clashserver
 ENV_FILE=$CS_ETC/clashserver.env
 PANEL_CFG=$CS_ETC/panel.json
-CADDYFILE=/etc/caddy/Caddyfile
-CADDY_KEYRING=/usr/share/keyrings/caddy-stable-archive-keyring.gpg
-CADDY_LIST=/etc/apt/sources.list.d/caddy-stable.list
+ACME_HOME=$CS_ETC/acme.sh          # acme.sh 安装目录（--home），账户与证书都在这里
+ACMESH_VERSION=3.1.6               # 固定版本，避免上游参数变动
 REPO_API=https://api.github.com/repos/MetaCubeX/mihomo/releases/latest
-LE_STAGING=https://acme-staging-v02.api.letsencrypt.org/directory
 REALITY_SNI=www.sc.com
 DOMAIN_RE='^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$'
+WILDCARD_DOMAIN_RE='^(\*\.)?([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$'
 
 MODE=no-cert MODE_SET=0 NODES=3 VPS_NAME="" SERVER_IP=""   # NODES：固定 3 个 Reality 节点
-DOMAIN="" EMAIL="" TLS=production PANEL_PORT=8088
-CADDY_OURS=0 PANEL_PASS="" PANEL_HASH="" SUB_TOKEN="" WARNINGS=()
+CERT_MODE=port CERT_MODE_SET=0 CF_TOKEN=""                 # CERT_MODE：port（端口模式）| dns（DNS API 模式）
+DOMAIN="" EMAIL="" TLS=staging PANEL_PORT=8443             # 默认 Let's Encrypt staging；面板默认 8443（不占 443）
+PANEL_PASS="" PANEL_HASH="" SUB_TOKEN="" WARNINGS=()
 STEP=0; TOTAL=8
 
 log()  { printf '\033[1;34m[%d/%d]\033[0m %s\n' "$((++STEP))" "$TOTAL" "$*"; }
@@ -72,23 +72,31 @@ load_env() { # persisted install settings; CLI flags given this run win
     case "$k" in
       VPS_NAME)   [[ -n $VPS_NAME ]]  || VPS_NAME=$v ;;
       SERVER_IP)  [[ -n $SERVER_IP ]] || SERVER_IP=$v ;;
-      MODE|DOMAIN|TLS|PANEL_PORT|CADDY_OURS) printf -v "$k" '%s' "$v" ;;
+      MODE|CERT_MODE|CF_TOKEN|DOMAIN|TLS|EMAIL|PANEL_PORT) printf -v "$k" '%s' "$v" ;;
     esac
   done < "$ENV_FILE"
 }
 
 save_env() {
   install -d -m 755 "$CS_ETC"
+  umask 077
   cat > "$ENV_FILE" <<EOF
 MODE="$MODE"
+CERT_MODE="$CERT_MODE"
 VPS_NAME="$VPS_NAME"
 SERVER_IP="$SERVER_IP"
 DOMAIN="$DOMAIN"
 TLS="$TLS"
+EMAIL="$EMAIL"
 PANEL_PORT="$PANEL_PORT"
-CADDY_OURS="$CADDY_OURS"
+CF_TOKEN="$CF_TOKEN"
 EOF
-  chmod 644 "$ENV_FILE"
+  # 开发用（不写入用户文档）：指向本地 pebble 等 ACME 测试服务，定时续期也沿用
+  if [[ -n ${CS_ACME_SERVER:-} ]]; then printf 'CS_ACME_SERVER="%s"\n' "$CS_ACME_SERVER" >> "$ENV_FILE"; fi
+  if [[ -n ${CS_ACME_INSECURE:-} ]]; then printf 'CS_ACME_INSECURE="%s"\n' "$CS_ACME_INSECURE" >> "$ENV_FILE"; fi
+  if [[ -n ${CS_DNS_HOOK:-} ]]; then printf 'CS_DNS_HOOK="%s"\n' "$CS_DNS_HOOK" >> "$ENV_FILE"; fi
+  if [[ -n ${CS_DNSSLEEP:-} ]]; then printf 'CS_DNSSLEEP="%s"\n' "$CS_DNSSLEEP" >> "$ENV_FILE"; fi
+  chmod 600 "$ENV_FILE"
 }
 
 svc_state() {
@@ -108,9 +116,16 @@ require_panel() { [[ $MODE == auto-cert && -f $PANEL_CFG ]] || die "该功能仅
 
 tls_label() {
   case $TLS in
-    staging)  printf 'Let'"'"'s Encrypt 测试证书（不受信任）' ;;
-    internal) printf 'Caddy 内部 CA（仅开发调试）' ;;
+    staging)  printf 'Let'"'"'s Encrypt 测试证书（staging）' ;;
+    internal) printf '自签证书（仅开发调试）' ;;
     *)        printf 'Let'"'"'s Encrypt 正式证书' ;;
+  esac
+}
+
+cert_mode_label() {
+  case ${CERT_MODE:-port} in
+    dns) printf 'DNS API 模式' ;;
+    *)   printf '端口模式' ;;
   esac
 }
 
@@ -126,7 +141,7 @@ install_files() { # 把源码树 $CS_HOME 安装到 $LIB_DIR（先写新目录�
   rm -rf "$new"; install -d -m 755 "$new"
   for d in install.sh uninstall.sh panel resources scripts; do cp -r "$CS_HOME/$d" "$new/"; done
   rm -rf "$new/panel/__pycache__"
-  chmod 755 "$new/install.sh" "$new/uninstall.sh" "$new/scripts/cmd/clashserver.sh" "$new/scripts/certsync.sh" "$new/panel/panel.py"
+  chmod 755 "$new/install.sh" "$new/uninstall.sh" "$new/scripts/cmd/clashserver.sh" "$new/scripts/certctl.sh" "$new/panel/panel.py"
   rm -rf "$LIB_DIR.old"
   if [[ -d $LIB_DIR ]]; then mv "$LIB_DIR" "$LIB_DIR.old"; fi
   mv "$new" "$LIB_DIR"

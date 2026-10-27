@@ -24,6 +24,7 @@ clashserver —— Mihomo 代理服务端管理命令
   reset-sub         更换订阅链接，旧链接立即失效
   passwd            修改面板密码（自定义）
   reset-password    重置面板密码（随机生成）
+  cert              立即申请 / 续期证书（自动证书模式，平时自动续期）
   restart           重启 Mihomo
   update            更新 Mihomo 内核 + clashserver 自身（update core / update self 只更新其一）
   log               查看最近日志
@@ -37,25 +38,53 @@ EOF
 
 interactive_setup() {
   has_tty || return 0
-  local menu=0
+  local menu=0 c p
   if ((!MODE_SET)); then
     menu=1
     printf '\n\033[1mclashserver 一键安装\033[0m\n\n'
     printf '请选择安装模式：\n'
     printf '  1) 无证书模式（默认）：仅 VLESS Reality 节点，安装后输出客户端配置\n'
-    printf '  2) 自动证书模式：需要一个已解析到本机的域名，提供 HTTPS 管理面板和订阅链接\n'
-    local c
+    printf '  2) 自动证书模式：申请域名证书，提供 HTTPS 管理面板和订阅链接\n'
     while :; do
       c=$(ask '请输入 [1/2]（回车默认 1）：' 1)
       case $c in 1) MODE=no-cert; break ;; 2) MODE=auto-cert; break ;; *) printf '请输入 1 或 2\n' ;; esac
     done
   fi
   [[ $MODE == auto-cert ]] || return 0
-  while [[ -z $DOMAIN || ! ${DOMAIN,,} =~ $DOMAIN_RE ]]; do
-    [[ -n $DOMAIN ]] && printf '域名格式不正确：%s\n' "$DOMAIN"
-    DOMAIN=$(ask '请输入域名（需已将 A 记录解析到本机）：' '')
-  done
+  if ((!CERT_MODE_SET)) && ((menu)); then
+    printf '\n请选择证书申请方式：\n'
+    printf '  1) 端口模式（默认）：申请/续期时临时占用 80 端口（需将域名解析到本机并放行 TCP 80）\n'
+    printf '  2) DNS API 模式：使用 Cloudflare API Token 验证（无需占用 80/443 端口，支持 *.泛域名）\n'
+    while :; do
+      c=$(ask '请输入 [1/2]（回车默认 1）：' 1)
+      case $c in 1) CERT_MODE=port; break ;; 2) CERT_MODE=dns; break ;; *) printf '请输入 1 或 2\n' ;; esac
+    done
+  fi
+  if [[ $CERT_MODE == dns ]]; then
+    while [[ -z $DOMAIN || ! ${DOMAIN,,} =~ $WILDCARD_DOMAIN_RE ]]; do
+      [[ -n $DOMAIN ]] && printf '域名格式不正确：%s\n' "$DOMAIN"
+      DOMAIN=$(ask '请输入域名（如 example.com 或 *.example.com）：' '')
+    done
+    while [[ -z $CF_TOKEN || $CF_TOKEN =~ [[:space:]\"\'] ]]; do
+      [[ -n $CF_TOKEN ]] && printf 'API Token 不能包含空格或引号\n'
+      CF_TOKEN=$(ask '请输入 Cloudflare API Token（需具备该域名的 DNS 编辑权限）：' '')
+    done
+  else
+    while [[ -z $DOMAIN || ! ${DOMAIN,,} =~ $DOMAIN_RE ]]; do
+      if [[ $DOMAIN == \*.* ]]; then
+        printf '通配符域名仅支持「DNS API 模式」，请输入具体域名\n'
+      elif [[ -n $DOMAIN ]]; then
+        printf '域名格式不正确：%s\n' "$DOMAIN"
+      fi
+      DOMAIN=$(ask '请输入域名（需已将 A 记录解析到本机）：' '')
+    done
+  fi
   ((menu)) || return 0   # 开发用隐藏参数 -d 启动时不再追问
+  while :; do
+    p=$(ask "请输入管理面板 HTTPS 端口（回车默认 $PANEL_PORT）：" "$PANEL_PORT")
+    if [[ $p =~ ^[0-9]+$ ]] && ((p >= 1 && p <= 65535)); then PANEL_PORT=$p; break; fi
+    printf '请输入 1-65535 之间的端口号\n'
+  done
   if [[ -z $EMAIL ]]; then EMAIL=$(ask '证书通知邮箱（可选，回车跳过）：' ''); fi
   return 0
 }
@@ -83,35 +112,35 @@ verify() {
     info "监听中：$name :$port"
   done < "$STATE"
   [[ $MODE == auto-cert ]] || return 0
-  local i
-  for ((i = 0; i < 10; i++)); do curl -fsS "http://127.0.0.1:$PANEL_PORT/healthz" >/dev/null 2>&1 && break; sleep 1; done
-  ((i < 10)) || { journalctl -u clashserve -n 20 --no-pager >&2; die "面板未在 127.0.0.1:$PANEL_PORT 响应"; }
-  info "面板：127.0.0.1:$PANEL_PORT 正常"
-  local base="http://127.0.0.1:$PANEL_PORT/sub"
-  curl -fsS "$base/$SUB_TOKEN/mihomo.yaml" | grep -q '^proxies:' || die "订阅接口没有返回 mihomo 配置"
-  [[ $(curl -s -o /dev/null -w '%{http_code}' "$base/wrongtoken0000000000000000/mihomo.yaml") == 404 ]] \
-    || die "订阅接口未拒绝错误的 token"
+  local i h p
+  h=$(panel_host); p=$(panel_port)
+  for ((i = 0; i < 10; i++)); do panel_https_ok /healthz >/dev/null && break; sleep 1; done
+  ((i < 10)) || { journalctl -u clashserve -n 20 --no-pager >&2; die "面板未在 $p 端口响应 HTTPS"; }
+  info "面板：$(panel_url) 正常（面板自身 HTTPS，证书与 Mihomo 共用）"
+  panel_https_ok "/sub/$SUB_TOKEN/mihomo.yaml" | grep -q '^proxies:' || die "订阅接口没有返回 mihomo 配置"
+  [[ $(curl -sk -o /dev/null -w '%{http_code}' --resolve "$h:$p:127.0.0.1" \
+    "$(panel_url)/sub/wrongtoken0000000000000000/mihomo.yaml") == 404 ]] || die "订阅接口未拒绝错误的 token"
   info "订阅链接：需要 token（错误 token 返回 404）正常"
-  if curl -fsSk --max-time 10 --resolve "$DOMAIN:443:127.0.0.1" "https://$DOMAIN/healthz" >/dev/null 2>&1; then
-    info "Caddy：https://$DOMAIN -> 面板 正常"
-  else
-    warn "https://$DOMAIN 暂时无法访问（证书可能尚未签发），可查看 journalctl -u caddy -n 50"
-  fi
 }
 
 print_summary() {
   printf '\n\033[1;32m✔ 安装完成！\033[0m\n\n'
   printf '请在云服务商的防火墙 / 安全组放行以下 TCP 端口：'
-  [[ $MODE == auto-cert ]] && printf ' 80 443'
+  if [[ $MODE == auto-cert ]]; then
+    [[ ${CERT_MODE:-port} == port ]] && printf ' 80'
+    [[ $PANEL_PORT == 80 && ${CERT_MODE:-port} == port ]] || printf ' %s' "$PANEL_PORT"
+  fi
   awk -F'\t' '{printf " %s", $2}' "$STATE"; printf '\n'
   if [[ $MODE == auto-cert ]]; then
     printf '\n\033[1mmihomo 订阅链接\033[0m（导入 mihomo / Clash 客户端即可；链接即凭证，泄露后执行 clashserver reset-sub 更换）：\n'
     printf '  \033[1;36m%s\033[0m\n' "$(sub_url)"
     [[ $TLS == production ]] || printf '  注意：当前为%s，客户端可能拒绝下载订阅\n' "$(tls_label)"
     printf '\n\033[1m管理面板\033[0m\n'
-    printf '  地址：https://%s\n  用户名：admin\n' "$DOMAIN"
+    printf '  地址：%s\n  用户名：admin\n' "$(panel_url)"
     [[ -n $PANEL_PASS ]] && printf '  密码：%s（仅显示一次；可用 clashserver passwd 修改）\n' "$PANEL_PASS"
+    printf '  申请方式：%s\n' "$(cert_mode_label)"
     printf '  证书：%s\n' "$(tls_label)"
+    if cert_is_temp; then printf '  \033[1;33m证书尚未签发成功，当前为临时自签证书；检查配置后可执行 clashserver cert 立即重试\033[0m\n'; fi
     printf '\n本地客户端配置备份：%s\n' "$CLIENT_DIR"
   else
     printf '\n\033[1m客户端 proxies 片段\033[0m\n'
@@ -136,15 +165,18 @@ do_install() {
   fi
   interactive_setup
   check_existing
-  [[ $MODE == auto-cert ]] && TOTAL=14
+  [[ $MODE == auto-cert ]] && TOTAL=11
   [[ -n $VPS_NAME ]] || VPS_NAME=$(hostname)
   install_deps
   [[ $MODE == auto-cert ]] && preflight_cert
-  detect_ip; save_env
+  detect_ip
+  if [[ $MODE == auto-cert ]]; then check_dns; fi   # 尽早检查，解析不对可在装任何东西前退出
+  save_env
   install_core; ensure_user; log "安装 clashserver 文件"; install_files; gen_nodes; render_server; render_client; setup_service
   if [[ $MODE == auto-cert ]]; then
-    check_dns; install_caddy; write_caddyfile; sync_cert; setup_panel
+    install_acme; issue_cert; setup_panel
   fi
+  open_firewall
   verify
   print_summary
 }
@@ -175,10 +207,15 @@ update_self() {
   rm -rf "$tmp"
   install -m 644 "$LIB_DIR/scripts/init/mihomo.service" "$UNIT"
   if [[ $MODE == auto-cert ]]; then
-    install -m 644 "$LIB_DIR/scripts/init/clashserve.service" "$LIB_DIR/scripts/init/clashserver-certsync.service" \
-      "$LIB_DIR/scripts/init/clashserver-certsync.timer" /etc/systemd/system/
+    install -m 644 "$LIB_DIR/scripts/init/clashserve.service" "$LIB_DIR/scripts/init/clashserver-cert.service" \
+      "$LIB_DIR/scripts/init/clashserver-cert.timer" /etc/systemd/system/
   fi
   systemctl daemon-reload
+  if [[ $MODE == auto-cert ]]; then
+    migrate_lego
+    systemctl enable clashserver-cert.timer >/dev/null 2>&1 || true
+    systemctl restart clashserver-cert.timer || true   # 让新的触发规则立即生效
+  fi
   # 用新模板重新组装配置；校验失败则回滚
   cp -a "$CONF" "$CONF.bak"
   assemble_config
@@ -186,19 +223,41 @@ update_self() {
   info "clashserver 已更新到 GitHub main 最新版"
 }
 
+do_cert() { # 立即申请 / 续期证书
+  require_installed; load_env; require_panel
+  printf '正在申请 / 续期证书（%s，%s，%s）……\n' "$DOMAIN" "$(cert_mode_label)" "$(tls_label)"
+  if ! "$LIB_DIR/scripts/certctl.sh" renew; then
+    if [[ ${CERT_MODE:-port} == dns ]]; then
+      printf '\033[1;31m申请 / 续期失败\033[0m：请确认 Cloudflare API Token 具备 %s 的 DNS 编辑权限\n' "${DOMAIN#\*.}"
+    else
+      printf '\033[1;31m申请 / 续期失败\033[0m：请确认域名 A 记录指向 %s（没有指向别处的 AAAA 记录）、云防火墙放行 TCP 80、80 端口未被占用\n' "$SERVER_IP"
+    fi
+    return 1
+  fi
+  if cert_is_temp; then printf '\033[1;31m证书仍未签发\033[0m，请检查配置后重试\n'; return 1; fi
+  printf '证书正常：%s，到期 %s（剩余 %s 天；到期前 30 天内自动续期）\n' "$(cert_issuer)" "$(cert_enddate)" "$(cert_days_left)"
+}
+
 do_status() {
   require_installed; load_env
   printf '\033[1m运行状态\033[0m\n'
-  printf '  安装模式：%s\n' "$([[ $MODE == auto-cert ]] && echo '自动证书模式' || echo '无证书模式')"
+  printf '  安装模式：%s\n' "$([[ $MODE == auto-cert ]] && echo "自动证书模式（$(cert_mode_label)）" || echo '无证书模式')"
   printf '  Mihomo：%s  %s\n' "$(svc_state mihomo)" "$("$BIN" -v 2>/dev/null | head -n1 | awk '{print $3}')"
   if [[ $MODE == auto-cert ]]; then
-    printf '  Caddy：%s    面板：%s\n' "$(svc_state caddy)" "$(svc_state clashserve)"
+    printf '  面板：%s（%s）    证书自动续期：%s\n' "$(svc_state clashserve)" "$(panel_url)" "$(svc_state clashserver-cert.timer)"
     printf '  域名：%s（证书：%s）\n' "$DOMAIN" "$(tls_label)"
-    if [[ -f $CONF_DIR/certs/fullchain.pem ]]; then
-      printf '  证书到期：%s\n' "$(openssl x509 -noout -enddate -in "$CONF_DIR/certs/fullchain.pem" | cut -d= -f2)"
+    if cert_is_temp; then
+      printf '  证书：\033[1;31m尚未签发\033[0m（临时自签证书；可执行 clashserver cert 重试）\n'
+    elif [[ -f $CONF_DIR/certs/fullchain.pem ]]; then
+      local days; days=$(cert_days_left)
+      printf '  证书到期：%s（%s，剩余 %s 天）\n' "$(cert_enddate)" "$(cert_issuer)" "$days"
+      if [[ -n $days ]] && ((days < 14)); then
+        printf '  \033[1;33m证书即将到期且尚未续期成功\033[0m：请执行 clashserver cert 查看原因\n'
+      fi
     else
-      printf '  证书：\033[1;31m尚未同步\033[0m（systemctl start clashserver-certsync）\n'
+      printf '  证书：\033[1;31m缺失\033[0m（执行 clashserver cert）\n'
     fi
+    printf '  上次自动续期：%s\n' "$(cert_last_run)"
   fi
   printf '  节点端口：\n'
   local name port rest
@@ -220,7 +279,7 @@ do_info() {
   printf '客户端配置目录：%s\n' "$CLIENT_DIR"
   if [[ $MODE == auto-cert ]]; then
     SUB_TOKEN=$(panel_cfg_get sub_token)
-    printf '管理面板：https://%s（用户名 admin）\n' "$DOMAIN"
+    printf '管理面板：%s（用户名 admin）\n' "$(panel_url)"
     [[ -n $SUB_TOKEN ]] && printf '订阅链接：%s\n' "$(sub_url)"
   fi
   return 0
@@ -258,7 +317,7 @@ do_passwd() {
   SUB_TOKEN=$(panel_cfg_get sub_token)
   write_panel_cfg
   systemctl restart clashserve
-  printf '面板密码已修改。登录地址：https://%s（用户名 admin）\n' "$DOMAIN"
+  printf '面板密码已修改。登录地址：%s（用户名 admin）\n' "$(panel_url)"
 }
 
 do_reset_password() {
@@ -266,7 +325,7 @@ do_reset_password() {
   [[ $MODE == auto-cert && -f $PANEL_CFG ]] || die "未安装管理面板（仅自动证书模式提供）"
   set_panel_password
   systemctl restart clashserve
-  printf '管理面板：https://%s\n用户名：admin\n新密码：%s\n' "$DOMAIN" "$PANEL_PASS"
+  printf '管理面板：%s\n用户名：admin\n新密码：%s\n' "$(panel_url)" "$PANEL_PASS"
 }
 
 do_restart() {
@@ -280,7 +339,7 @@ do_restart() {
 do_log() {
   require_installed; load_env
   journalctl -u mihomo -n 50 --no-pager
-  [[ $MODE == auto-cert ]] && { echo; journalctl -u caddy -u clashserve -n 30 --no-pager; }
+  [[ $MODE == auto-cert ]] && { echo; journalctl -u clashserve -u clashserver-cert -n 30 --no-pager; }
   return 0
 }
 
@@ -290,8 +349,8 @@ do_menu() {
   local items=() labels=() i c
   items+=(status info);          labels+=("查看运行状态" "查看节点配置")
   if [[ $MODE == auto-cert ]]; then
-    items+=(sub reset-sub passwd reset-password)
-    labels+=("查看订阅链接" "更换订阅链接" "修改面板密码（自定义）" "重置面板密码（随机）")
+    items+=(sub reset-sub passwd reset-password cert)
+    labels+=("查看订阅链接" "更换订阅链接" "修改面板密码（自定义）" "重置面板密码（随机）" "立即申请 / 续期证书")
   fi
   items+=(restart log update uninstall); labels+=("重启 Mihomo" "查看日志" "更新（内核 + 脚本）" "卸载")
   while :; do
@@ -317,33 +376,37 @@ do_uninstall() {
   if [[ ${CS_IN_REINSTALL:-0} != 1 ]] && has_tty; then
     [[ $(ask '确定卸载 clashserver？所有节点、证书和配置都会被删除 [y/N]：' n) == [yY]* ]] || { echo "已取消"; return 0; }
   fi
-  systemctl disable --now clashserve clashserver-certsync.timer clashserver-certsync.service 2>/dev/null || true
-  rm -f /etc/systemd/system/clashserve.service /etc/systemd/system/clashserver-certsync.{service,timer}
-  if [[ $CADDY_OURS == 1 ]]; then
-    systemctl disable --now caddy 2>/dev/null || true
-    DEBIAN_FRONTEND=noninteractive apt-get purge -y -qq caddy >/dev/null 2>&1 || true
-    rm -rf /etc/caddy /var/lib/caddy "$CADDY_KEYRING" "$CADDY_LIST"
-  elif [[ -f $CADDYFILE ]] && grep -q '^# clashserver managed' "$CADDYFILE"; then
-    if [[ -f $CADDYFILE.clashserver.bak ]]; then mv -f "$CADDYFILE.clashserver.bak" "$CADDYFILE"; fi
-    systemctl reload caddy 2>/dev/null || true
-  fi
+  systemctl disable --now clashserve clashserver-cert.timer clashserver-cert.service 2>/dev/null || true
+  rm -f /etc/systemd/system/clashserve.service /etc/systemd/system/clashserver-cert.{service,timer}
   systemctl disable --now mihomo 2>/dev/null || true
-  rm -f "$UNIT" "$BIN" "$SELF_BIN"
+  rm -f "$UNIT" "$BIN" "$SELF_BIN" /usr/local/bin/lego /run/clashserver-cert.lock
   systemctl daemon-reload
-  rm -rf "$CONF_DIR" "$CLIENT_DIR" /var/lib/mihomo "$LIB_DIR" "$LIB_DIR.new" "$LIB_DIR.old" "$CS_ETC"
-  if id mihomo >/dev/null 2>&1; then userdel mihomo || true; fi
-  echo "已卸载：Mihomo、管理面板、证书、配置、客户端文件，以及由本脚本安装的 Caddy。"
+  rm -rf "$CONF_DIR" "$CLIENT_DIR" /var/lib/mihomo "$LIB_DIR" "$LIB_DIR.new" "$LIB_DIR.old"
+  if [[ ${CS_IN_REINSTALL:-0} == 1 && -d $ACME_HOME ]]; then
+    # 重装时保留 acme.sh 账户与已签发证书：同一域名直接复用，避免触发 Let's Encrypt 频率限制（同域名每周 5 张）
+    find "$CS_ETC" -mindepth 1 -maxdepth 1 ! -name "$(basename "$ACME_HOME")" -exec rm -rf {} +
+  else
+    rm -rf "$CS_ETC"
+  fi
+  if id mihomo >/dev/null 2>&1; then userdel -f mihomo 2>/dev/null || true; fi
+  echo "已卸载：Mihomo、管理面板、证书（含 acme.sh）、配置和客户端文件。"
 }
 
 ACTION=""
 while (($#)); do
   case "$1" in
-    install|update|uninstall|info|status|sub|passwd|restart|log|menu|reset-password|reset-sub) ACTION=$1 ;;
+    install|update|uninstall|info|status|sub|passwd|restart|log|menu|reset-password|reset-sub|cert) ACTION=$1 ;;
     core|self) [[ $ACTION == update ]] || die "未知参数：$1"; UPDATE_WHAT=$1 ;;
     help) usage; exit 0 ;;
     # 以下为开发/测试用隐藏参数，不写入用户文档
     -d|--domain) DOMAIN=${2:?缺少域名}; MODE=auto-cert; MODE_SET=1; shift ;;
+    --cert-mode)
+      case ${2:-} in port|dns) CERT_MODE=$2; CERT_MODE_SET=1; MODE=auto-cert; MODE_SET=1 ;; *) die "未知证书申请方式：${2:-}（可选 port|dns）" ;; esac
+      shift ;;
+    --cf-token) CF_TOKEN=${2:?缺少 Cloudflare API Token}; CERT_MODE=dns; CERT_MODE_SET=1; MODE=auto-cert; MODE_SET=1; shift ;;
+    --panel-port) PANEL_PORT=${2:?缺少面板端口}; shift ;;
     --staging|--tls-staging) TLS=staging ;;
+    --production|--tls-production) TLS=production ;;
     --tls-internal) TLS=internal ;;
     -h|--help) usage; exit 0 ;;
     *) die "未知参数：$1（查看帮助：-h）" ;;
@@ -358,5 +421,5 @@ if [[ -z $ACTION ]]; then
   else ACTION=install; fi
 fi
 need_root
-"do_${ACTION//-/_}"
+"do_${ACTION//-/_}" || exit $?   # 子命令自己已提示失败原因，不再触发 ERR trap 的「第 N 行执行失败」
 

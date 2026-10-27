@@ -1,6 +1,20 @@
 # shellcheck shell=bash
 # clashserver 管理面板与订阅链接
 
+panel_host() { printf '%s' "${DOMAIN#\*.}"; }
+
+panel_port() {
+  local p=${PANEL_PORT:-}
+  [[ -n $p ]] || p=$(panel_cfg_get port)
+  printf '%s' "${p:-8443}"
+}
+
+panel_url() {
+  local h p
+  h=$(panel_host); p=$(panel_port)
+  if [[ $p == 443 ]]; then printf 'https://%s' "$h"; else printf 'https://%s:%s' "$h" "$p"; fi
+}
+
 setup_panel() {
   log "配置管理面板"
   install -d -m 755 "$CS_ETC"
@@ -12,15 +26,24 @@ setup_panel() {
   systemctl restart clashserve
 }
 
+panel_https_ok() { # 本机访问面板 HTTPS（跳过证书校验，只验证 HTTPS 通路）
+  local h p
+  h=$(panel_host); p=$(panel_port)
+  curl -fsSk --max-time 5 --resolve "$h:$p:127.0.0.1" "https://$h:$p$1" 2>/dev/null
+}
+
 panel_cfg_get() { jq -r --arg k "$1" '.[$k] // empty' "$PANEL_CFG" 2>/dev/null || true; }
 
 new_sub_token() { openssl rand -hex 24; }
 
-sub_url() { printf 'https://%s/sub/%s/mihomo.yaml' "$DOMAIN" "$SUB_TOKEN"; }
+sub_url() { printf '%s/sub/%s/mihomo.yaml' "$(panel_url)" "$SUB_TOKEN"; }
 
 write_panel_cfg() { # PANEL_HASH + SUB_TOKEN -> panel.json (0600, root only)
-  jq -n --arg h "$PANEL_HASH" --arg t "$SUB_TOKEN" --argjson p "$PANEL_PORT" \
-    '{username:"admin", password_hash:$h, listen:"127.0.0.1", port:$p, sub_token:$t}' > "$PANEL_CFG.new"
+  local p; p=$(panel_port)
+  # 面板自己做 HTTPS（与 Mihomo 共用 /etc/mihomo/certs 证书），直接监听 0.0.0.0:$PANEL_PORT，不需要反代和 443
+  jq -n --arg h "$PANEL_HASH" --arg t "$SUB_TOKEN" --argjson p "$p" \
+    --arg c "$CONF_DIR/certs/fullchain.pem" --arg k "$CONF_DIR/certs/privkey.pem" \
+    '{username:"admin", password_hash:$h, listen:"0.0.0.0", port:$p, tls_cert:$c, tls_key:$k, sub_token:$t}' > "$PANEL_CFG.new"
   chmod 600 "$PANEL_CFG.new"; mv -f "$PANEL_CFG.new" "$PANEL_CFG"
 }
 
