@@ -14,7 +14,7 @@ if [[ -n ${CS_BOOTSTRAP_TMP:-} ]]; then trap 'rm -rf "$CS_BOOTSTRAP_TMP"' EXIT; 
 
 usage() {
   cat <<'EOF'
-clashserver —— Mihomo 代理服务端管理命令 (v0.55)
+clashserver —— Mihomo 代理服务端管理命令 (v0.6)
 
 用法：clashserver [子命令]
   （不带参数）       打开中文交互菜单
@@ -123,20 +123,22 @@ verify() {
   log "检查运行状态"
   sleep 2
   systemctl is-active --quiet mihomo || { journalctl -u mihomo -n 20 --no-pager >&2; die "mihomo 服务未能启动"; }
-  local name port rest
+  local name port rest ss_out
+  ss_out=$(ss -ltn 2>/dev/null || true)
   while IFS=$'\t' read -r name port rest; do
-    ss -ltn | grep -q ":$port " || die "节点 $name 未在端口 $port 监听"
+    grep -q ":$port " <<<"$ss_out" || die "节点 $name 未在端口 $port 监听"
     info "监听中：$name :$port"
   done < "$STATE"
   [[ $MODE == auto-cert ]] || return 0
-  ss -ltn | grep -q ":$CONTROLLER_PORT " || die "Mihomo 控制接口未在端口 $CONTROLLER_PORT 监听"
+  grep -q ":$CONTROLLER_PORT " <<<"$ss_out" || die "Mihomo 控制接口未在端口 $CONTROLLER_PORT 监听"
   info "Zashboard：$(zashboard_url) 正常"
-  local i h p
+  local i h p sub_body
   h=$(panel_host); p=$(panel_port)
   for ((i = 0; i < 10; i++)); do panel_https_ok /healthz >/dev/null && break; sleep 1; done
   ((i < 10)) || { journalctl -u clashserve -n 20 --no-pager >&2; die "面板未在 $p 端口响应 HTTPS"; }
   info "面板：$(panel_url)（端口 $p）正常（面板自身 HTTPS，证书与 Mihomo 共用）"
-  panel_https_ok "/sub/$SUB_TOKEN/mihomo.yaml" | grep -q '^proxies:' || die "订阅接口没有返回 mihomo 配置"
+  sub_body=$(panel_https_ok "/sub/$SUB_TOKEN/mihomo.yaml" || true)
+  grep -q 'proxies:' <<<"$sub_body" || die "订阅接口没有返回 mihomo 配置"
   [[ $(curl -sk -o /dev/null -w '%{http_code}' --resolve "$h:$p:127.0.0.1" \
     "$(panel_url)/sub/wrongtoken0000000000000000/mihomo.yaml") == 404 ]] || die "订阅接口未拒绝错误的 token"
   info "订阅链接：$(sub_url) 正常"
@@ -335,9 +337,9 @@ do_info() {
   [[ -n $VPS_NAME ]] || VPS_NAME=$(hostname)
   detect_ip
   echo "proxies:"
-  while IFS=$'\t' read -r name port uuid priv pub sid sni; do
+  while IFS=$'\t' read -r name port uuid priv pub sid sni dec enc; do
     [[ -n $name ]] || continue
-    echo "    - $(proxy_line "$name" "$port" "$uuid" "$pub" "$sid" "$sni")"
+    echo "    - $(proxy_line "$name" "$port" "$uuid" "$pub" "$sid" "$sni" "${enc:-}")"
   done < "$STATE"
   if [[ -f $CS_ETC/inbounds.json ]]; then
     jq -rc '.[] | .client' "$CS_ETC/inbounds.json" 2>/dev/null | while IFS= read -r c; do

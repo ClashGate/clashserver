@@ -17,8 +17,8 @@ if [[ -n $HERE && -f $HERE/scripts/cmd/clashserver.sh ]]; then
   CS_DEFAULT_ACTION=install exec bash "$HERE/scripts/cmd/clashserver.sh" "$@"
 fi
 
-command -v curl >/dev/null || die "缺少 curl，请先执行：apt-get install -y curl"
-command -v tar >/dev/null || die "缺少 tar，请先执行：apt-get install -y tar"
+command -v curl >/dev/null || die "缺少 curl，请先安装（如 apt-get install -y curl 或 dnf/yum install -y curl）"
+command -v tar >/dev/null || die "缺少 tar，请先安装（如 apt-get install -y tar 或 dnf/yum install -y tar）"
 tmp=$(mktemp -d /tmp/clashserver.XXXXXX)
 printf '正在从 GitHub 下载 clashserver……\n'
 curl -fsSL --retry 3 "$REPO_TARBALL" | tar -xz -C "$tmp" --strip-components=1 \

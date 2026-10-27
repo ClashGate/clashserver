@@ -3,24 +3,40 @@
 
 install_deps() {
   log "安装依赖"
+  detect_pkg_mgr
+  [[ -n $PKG_MGR ]] || die "未检测到受支持的包管理器（需要 apt / dnf / yum）"
   local missing=()
-  for c in curl gzip jq openssl; do command -v "$c" >/dev/null || missing+=("$c"); done
-  command -v ss >/dev/null || missing+=(iproute2)
+  for c in curl gzip tar jq openssl; do command -v "$c" >/dev/null || missing+=("$c"); done
+  if ! command -v ss >/dev/null; then
+    [[ $PKG_MGR == apt ]] && missing+=(iproute2) || missing+=(iproute)
+  fi
+  command -v flock >/dev/null || missing+=(util-linux)
   if [[ $MODE == auto-cert ]]; then
     command -v python3 >/dev/null || missing+=(python3)
     if [[ ${CERT_MODE:-port} != manual ]]; then
       command -v socat >/dev/null || missing+=(socat)     # acme.sh standalone 模式需要
-      command -v getent >/dev/null || missing+=(libc-bin)
+      if ! command -v getent >/dev/null; then
+        [[ $PKG_MGR == apt ]] && missing+=(libc-bin) || missing+=(glibc-common)
+      fi
     fi
   fi
   if ((${#missing[@]})); then
-    info "apt 安装：${missing[*]}"
+    info "$PKG_MGR 安装：${missing[*]}"
     local i
-    for i in 1 2 3; do apt-get update -qq >/dev/null 2>&1 && break; ((i < 3)) || die "apt-get update 失败，请检查软件源和网络"; sleep 5; done
-    for i in 1 2 3; do
-      DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "${missing[@]}" ca-certificates >/dev/null 2>&1 && break
-      ((i < 3)) || die "依赖安装失败：${missing[*]}"; sleep 5
-    done
+    if [[ $PKG_MGR == apt ]]; then
+      for i in 1 2 3; do apt-get update -qq >/dev/null 2>&1 && break; ((i < 3)) || die "apt-get update 失败，请检查软件源和网络"; sleep 5; done
+      for i in 1 2 3; do
+        DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "${missing[@]}" ca-certificates >/dev/null 2>&1 && break
+        ((i < 3)) || die "依赖安装失败：${missing[*]}"; sleep 5
+      done
+    else
+      for i in 1 2 3; do
+        "$PKG_MGR" install -y -q "${missing[@]}" ca-certificates >/dev/null 2>&1 && break
+        "$PKG_MGR" install -y -q epel-release >/dev/null 2>&1 || true
+        "$PKG_MGR" install -y -q "${missing[@]}" ca-certificates >/dev/null 2>&1 && break
+        ((i < 3)) || die "依赖安装失败（$PKG_MGR）：${missing[*]}"; sleep 5
+      done
+    fi
   fi
 }
 
@@ -70,7 +86,9 @@ rand_port() {
 }
 
 ensure_user() {
-  id mihomo >/dev/null 2>&1 || useradd --system --no-create-home --shell /usr/sbin/nologin mihomo
+  local nologin=/usr/sbin/nologin
+  [[ -x $nologin ]] || nologin=/sbin/nologin
+  id mihomo >/dev/null 2>&1 || useradd --system --no-create-home --shell "$nologin" mihomo
   install -d -m 775 -o root -g mihomo "$CONF_DIR"
   install -d -m 750 -o root -g mihomo "$CONF_DIR/certs"
   install -d -m 700 -o root -g root "$CLIENT_DIR"
@@ -80,16 +98,21 @@ ensure_user() {
 gen_nodes() {
   log "生成 $NODES 个 VLESS Reality 节点"
   : > "$STATE.new"; chmod 640 "$STATE.new"
-  local i kp priv pub name
+  local i kp priv pub vkp dec enc name sni
   for ((i = 1; i <= NODES; i++)); do
     kp=$("$BIN" generate reality-keypair)
     priv=$(awk '/PrivateKey/{print $2}' <<<"$kp")
     pub=$(awk '/PublicKey/{print $2}' <<<"$kp")
     [[ -n "$priv" && -n "$pub" ]] || { rm -f "$STATE.new"; die "Reality 密钥对生成失败"; }
+    vkp=$("$BIN" generate vless-x25519)
+    dec=$(sed -n 's/.*\[Server\][[:space:]]*decryption:[[:space:]]*"\([^"]*\)".*/\1/p' <<<"$vkp")
+    enc=$(sed -n 's/.*\[Client\][[:space:]]*encryption:[[:space:]]*"\([^"]*\)".*/\1/p' <<<"$vkp")
+    [[ -n "$dec" && -n "$enc" ]] || { rm -f "$STATE.new"; die "VLESS Encryption 密钥生成失败"; }
     name=$([[ $i -eq 1 ]] && echo "VlessReality" || echo "VlessReality-$i")
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$name" "$(rand_port)" \
+    sni=$(rand_sni)
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$name" "$(rand_port)" \
       "$(cat /proc/sys/kernel/random/uuid)" "$priv" "$pub" "$(openssl rand -hex 4)" \
-      "$REALITY_SNI" >> "$STATE.new"
+      "$sni" "$dec" "$enc" >> "$STATE.new"
   done
   mv -f "$STATE.new" "$STATE"
 }
@@ -195,8 +218,9 @@ assemble_config() {
 render_server() {
   log "写入服务端配置"
   render_controller
-  local listeners="" name port uuid priv pub sid sni
-  while IFS=$'\t' read -r name port uuid priv pub sid sni; do
+  local listeners="" name port uuid priv pub sid sni dec enc
+  while IFS=$'\t' read -r name port uuid priv pub sid sni dec enc; do
+    [[ -n $name ]] || continue
     listeners+="  - name: $name
     type: vless
     udp: true
@@ -206,7 +230,10 @@ render_server() {
       - username: user
         uuid: $uuid
         flow: xtls-rprx-vision
-    reality-config:
+"
+    [[ -n ${dec:-} ]] && listeners+="    decryption: $dec
+"
+    listeners+="    reality-config:
       dest: $sni:443
       private-key: $priv
       short-id:
@@ -225,17 +252,19 @@ render_server() {
   validate_conf || die "生成的服务端配置未通过校验（mihomo -t）"
 }
 
-proxy_line() { # name port uuid pub sid sni
-  printf '{"name":"%s|Clash|Reality","type":"vless","server":"%s","port":%s,"uuid":"%s","tls":true,"flow":"xtls-rprx-vision","client-fingerprint":"safari","skip-cert-verify":false,"reality-opts":{"public-key":"%s","short-id":"%s"},"network":"tcp","udp":true,"servername":"%s"}' \
-    "$VPS_NAME-$1" "$SERVER_IP" "$2" "$3" "$4" "$5" "$6"
+proxy_line() { # name port uuid pub sid sni [enc]
+  local enc_part=""
+  [[ -n ${7:-} ]] && enc_part=$(printf ',"encryption":"%s"' "$7")
+  printf '{"name":"%s|Clash|Reality","type":"vless","server":"%s","port":%s,"uuid":"%s","tls":true,"flow":"xtls-rprx-vision","client-fingerprint":"safari","skip-cert-verify":false%s,"reality-opts":{"public-key":"%s","short-id":"%s"},"network":"tcp","udp":true,"servername":"%s"}' \
+    "$VPS_NAME-$1" "$SERVER_IP" "$2" "$3" "$enc_part" "$4" "$5" "$6"
 }
 
 render_client() {
   log "生成客户端配置"
-  local proxies="" names="" name port uuid priv pub sid sni line cname p_arg n_arg
-  while IFS=$'\t' read -r name port uuid priv pub sid sni; do
+  local proxies="" names="" name port uuid priv pub sid sni dec enc line cname p_arg n_arg
+  while IFS=$'\t' read -r name port uuid priv pub sid sni dec enc; do
     [[ -n $name ]] || continue
-    line=$(proxy_line "$name" "$port" "$uuid" "$pub" "$sid" "$sni")
+    line=$(proxy_line "$name" "$port" "$uuid" "$pub" "$sid" "$sni" "${enc:-}")
     proxies+="  - $line"$'\n'
     names+="      - \"$VPS_NAME-$name|Clash|Reality\""$'\n'
   done < "$STATE"
@@ -255,20 +284,25 @@ render_client() {
   chmod 600 "$CLIENT_DIR/mihomo-client.yaml"
   { echo "proxies:"; printf '%s' "${proxies:-  []$'\n'}"; } > "$CLIENT_DIR/proxies.yaml"
   chmod 600 "$CLIENT_DIR/proxies.yaml"
-  [[ -e /root/clashserver-client ]] || ln -sfn "$CLIENT_DIR" /root/clashserver-client
+  [[ -e /root/clashserver-client ]] || ln -sfn "$CLIENT_DIR" /root/clashserver-client 2>/dev/null || true
 }
 
-open_firewall() { # 本机启用了 ufw 时自动放行所需端口（云服务商安全组仍需自行放行）
-  command -v ufw >/dev/null && ufw status 2>/dev/null | grep -q '^Status: active' || return 0
+open_firewall() { # 本机启用了 ufw 或 firewalld 时自动放行所需端口（云服务商安全组仍需自行放行）
   local p ports=()
   if [[ $MODE == auto-cert ]]; then
     [[ ${CERT_MODE:-port} == port ]] && ports+=(80/tcp)
     [[ $PANEL_PORT == 80 && ${CERT_MODE:-port} == port ]] || ports+=("$PANEL_PORT/tcp")
     ports+=("$CONTROLLER_PORT/tcp")
   fi
-  while IFS=$'\t' read -r _ p _; do ports+=("$p/tcp"); done < "$STATE"
-  for p in "${ports[@]}"; do ufw allow "$p" >/dev/null 2>&1 || true; done
-  info "检测到 ufw 已启用，已放行：${ports[*]}"
+  while IFS=$'\t' read -r _ p _; do [[ -n $p ]] && ports+=("$p/tcp" "$p/udp"); done < "$STATE"
+  if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q '^Status: active'; then
+    for p in "${ports[@]}"; do ufw allow "$p" >/dev/null 2>&1 || true; done
+    info "检测到 ufw 已启用，已放行：${ports[*]}"
+  elif command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
+    for p in "${ports[@]}"; do firewall-cmd --permanent --add-port="$p" >/dev/null 2>&1 || true; done
+    firewall-cmd --reload >/dev/null 2>&1 || true
+    info "检测到 firewalld 已启用，已放行：${ports[*]}"
+  fi
 }
 
 setup_service() {

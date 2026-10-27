@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""clashserve v0.55 - rebuilt admin console for clashserver (certificate modes).
+"""clashserve v0.6 - rebuilt admin console for clashserver (certificate modes).
 
-Stdlib only (Debian python3). Serves HTTPS itself with the same certificate
+Stdlib only (Python 3). Serves HTTPS itself with the same certificate
 Mihomo uses (/etc/clashserve/certs); no reverse proxy.
 Unified directory layout under /etc/clashserve with automatic migration from
 legacy /etc/mihomo, /etc/clashserver, /var/lib/mihomo, /root/clashserver-client.
@@ -33,7 +33,7 @@ import uuid as uuidlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse, quote
 
-VERSION = "0.55"
+VERSION = "0.6"
 
 # CLASHSERVER_ROOT lets the panel run against a fake tree for local testing.
 ROOT = os.environ.get("CLASHSERVER_ROOT", "")
@@ -62,9 +62,25 @@ KEY_REL = "certs/privkey.pem"
 MIHOMO_BIN = os.environ.get("MIHOMO_BIN", CS_ROOT + "/mihomo" if os.path.isfile(CS_ROOT + "/mihomo") else "/usr/local/bin/mihomo")
 SYSTEMCTL = os.environ.get("SYSTEMCTL", "systemctl")
 UFW_BIN = os.environ.get("UFW_BIN", "ufw")
-REALITY_SNI = "www.sc.com"
+FIREWALL_CMD_BIN = os.environ.get("FIREWALL_CMD_BIN", "firewall-cmd")
+REALITY_SNI_POOL = (
+    "www.microsoft.com",
+    "www.apple.com",
+    "addons.mozilla.org",
+    "www.yahoo.com",
+    "www.amd.com",
+    "www.nvidia.com",
+    "www.samsung.com",
+    "www.cisco.com",
+    "www.oracle.com",
+    "www.lovelive-anime.jp",
+)
 PBKDF2_ITER = 600_000
 SESSION_TTL = 12 * 3600
+
+
+def pick_reality_sni() -> str:
+    return random.choice(REALITY_SNI_POOL)
 
 TYPES = (
     "vless-reality", "shadowsocks", "hysteria2", "snell", "trusttunnel",
@@ -241,8 +257,12 @@ def read_nodes() -> list:
             for line in f:
                 p = line.rstrip("\n").split("\t")
                 if len(p) >= 7:
-                    rows.append({"name": p[0], "port": int(p[1]), "uuid": p[2],
-                                 "priv": p[3], "pub": p[4], "sid": p[5], "sni": p[6]})
+                    rows.append({
+                        "name": p[0], "port": int(p[1]), "uuid": p[2],
+                        "priv": p[3], "pub": p[4], "sid": p[5], "sni": p[6],
+                        "dec": p[7] if len(p) >= 8 else "",
+                        "enc": p[8] if len(p) >= 9 else "",
+                    })
     except FileNotFoundError:
         pass
     return rows
@@ -1022,7 +1042,7 @@ def listener_to_inbound(lst: dict, env: dict, existing_by_name: dict = None) -> 
         kind = "vless-reality"
         rcfg = lst["reality-config"]
         snames = rcfg.get("server-names")
-        sni = (snames[0] if isinstance(snames, list) and snames else str(rcfg.get("dest", REALITY_SNI)).split(":")[0]).strip()
+        sni = (snames[0] if isinstance(snames, list) and snames else str(rcfg.get("dest", "")).split(":")[0]).strip() or pick_reality_sni()
         sids = rcfg.get("short-id")
         sid = str(sids[0] if isinstance(sids, list) and sids else (sids or "")).strip()
         priv = str(rcfg.get("private-key") or "").strip()
@@ -1037,9 +1057,19 @@ def listener_to_inbound(lst: dict, env: dict, existing_by_name: dict = None) -> 
             "name": f"{label}|Clash|Reality", "type": "vless", "server": ip, "port": port,
             "uuid": uid, "tls": True, "flow": flow or "xtls-rprx-vision",
             "client-fingerprint": "safari", "skip-cert-verify": False,
+        }
+        if lst.get("decryption") and str(lst.get("decryption")) != "none":
+            enc = ""
+            if prev and isinstance(prev.get("client"), dict) and prev.get("listener", {}).get("decryption") == lst.get("decryption"):
+                enc = prev["client"].get("encryption", "")
+            if not enc:
+                enc = derive_vless_encryption(str(lst["decryption"]))
+            if enc:
+                client["encryption"] = enc
+        client.update({
             "reality-opts": {"public-key": pub, "short-id": sid},
             "network": "tcp", "udp": True, "servername": sni,
-        }
+        })
     elif ltype == "vless":
         kind = "vless"
         client = {
@@ -1137,7 +1167,7 @@ def listener_to_inbound(lst: dict, env: dict, existing_by_name: dict = None) -> 
     elif ltype == "snell":
         kind = "snell"
         ver = int(lst.get("version") or 5)
-        obfs = lst.get("obfs-opts") if isinstance(lst.get("obfs-opts"), dict) else {"mode": "tls", "host": REALITY_SNI}
+        obfs = lst.get("obfs-opts") if isinstance(lst.get("obfs-opts"), dict) else {"mode": "tls", "host": pick_reality_sni()}
         client = {
             "name": f"{label}|Clash|Snell", "type": "snell", "server": ip, "port": port,
             "psk": str(lst.get("psk", "")), "version": ver, "udp": True, "obfs-opts": obfs,
@@ -1217,7 +1247,7 @@ def parse_custom_config_state(raw_yaml: str, env: dict = None) -> tuple:
         rc_inb = {
             "id": secrets.token_hex(6), "kind": "vless-reality", "port": n["port"],
             "name": n["name"], "created": int(time.time()),
-            "listener": {"reality-config": {"private-key": n["priv"]}},
+            "listener": {"reality-config": {"private-key": n["priv"]}, "decryption": n.get("dec", "")},
             "client": reality_client(n, env),
         }
         existing_by_name[n["name"]] = rc_inb
@@ -1291,19 +1321,25 @@ def build_inbound(kind: str, form: dict, env: dict) -> dict:
     label = f"{vps}-{name}"
 
     if kind == "vless-reality":
-        sni = (form.get("reality_sni") or REALITY_SNI).strip()
+        sni = (form.get("reality_sni") or "").strip() or pick_reality_sni()
         if not re.fullmatch(r"[A-Za-z0-9.-]{1,128}", sni):
             raise ValueError("Reality 伪装域名（SNI）格式无效")
+        use_enc = (form.get("reality_enc") or "x25519").strip() != "none"
         priv, pub = reality_keypair()
         uid, sid = str(uuidlib.uuid4()), secrets.token_hex(4)
         listener = {**base, "type": "vless", "udp": True,
-                    "users": [{"username": "user", "uuid": uid, "flow": "xtls-rprx-vision"}],
-                    "reality-config": {"dest": f"{sni}:443", "private-key": priv,
-                                       "short-id": [sid], "server-names": [sni]}}
+                    "users": [{"username": "user", "uuid": uid, "flow": "xtls-rprx-vision"}]}
         client = {"name": f"{label}|Clash|Reality", "type": "vless", "server": ip, "port": port,
                   "uuid": uid, "tls": True, "flow": "xtls-rprx-vision", "client-fingerprint": "safari",
-                  "skip-cert-verify": False, "reality-opts": {"public-key": pub, "short-id": sid},
-                  "network": "tcp", "udp": True, "servername": sni}
+                  "skip-cert-verify": False}
+        if use_enc:
+            dec, enc = vless_x25519_keypair()
+            listener["decryption"] = dec
+            client["encryption"] = enc
+        listener["reality-config"] = {"dest": f"{sni}:443", "private-key": priv,
+                                      "short-id": [sid], "server-names": [sni]}
+        client.update({"reality-opts": {"public-key": pub, "short-id": sid},
+                       "network": "tcp", "udp": True, "servername": sni})
 
     elif kind == "shadowsocks":
         cipher = (form.get("ss_cipher") or "aes-128-gcm").strip()
@@ -1337,7 +1373,7 @@ def build_inbound(kind: str, form: dict, env: dict) -> dict:
         obfs_mode = (form.get("snell_obfs") or "tls").strip()
         if obfs_mode not in ("tls", "http"):
             obfs_mode = "tls"
-        obfs_host = (form.get("snell_host") or REALITY_SNI).strip()
+        obfs_host = (form.get("snell_host") or "").strip() or pick_reality_sni()
         psk = base64.b64encode(secrets.token_bytes(16)).decode()
         listener = {**base, "type": "snell", "psk": psk, "version": version, "udp": True,
                     "obfs-opts": {"mode": obfs_mode, "host": obfs_host}}
@@ -1428,7 +1464,7 @@ def build_inbound(kind: str, form: dict, env: dict) -> dict:
         if net not in ("tcp", "xhttp", "ws", "grpc"):
             net = "tcp"
         use_tls = form.get("vless_tls", "1") == "1"
-        use_enc = (form.get("vless_enc") or "none").strip() == "x25519"
+        use_enc = (form.get("vless_enc") or "x25519").strip() != "none"
         raw_path = (form.get("vless_path") or "").strip()
         path = raw_path if raw_path else ("/" + secrets.token_hex(4))
         if not path.startswith("/"):
@@ -1551,15 +1587,21 @@ def build_inbound(kind: str, form: dict, env: dict) -> dict:
 
 
 def render_nodes_tsv(nodes: list) -> str:
-    return "".join(
-        f"{n['name']}\t{n['port']}\t{n['uuid']}\t{n['priv']}\t{n['pub']}\t{n['sid']}\t{n['sni']}\n"
-        for n in nodes
-    )
+    out = []
+    for n in nodes:
+        dec = n.get("dec", "")
+        enc = n.get("enc", "")
+        if dec or enc:
+            out.append(f"{n['name']}\t{n['port']}\t{n['uuid']}\t{n['priv']}\t{n['pub']}\t{n['sid']}\t{n['sni']}\t{dec}\t{enc}\n")
+        else:
+            out.append(f"{n['name']}\t{n['port']}\t{n['uuid']}\t{n['priv']}\t{n['pub']}\t{n['sid']}\t{n['sni']}\n")
+    return "".join(out)
 
 
 def render_reality(nodes: list) -> str:
     out = []
     for n in nodes:
+        dec_line = f"    decryption: {n['dec']}\n" if n.get("dec") else ""
         out.append(
             f"  - name: {n['name']}\n"
             f"    type: vless\n"
@@ -1570,6 +1612,7 @@ def render_reality(nodes: list) -> str:
             f"      - username: user\n"
             f"        uuid: {n['uuid']}\n"
             f"        flow: xtls-rprx-vision\n"
+            f"{dec_line}"
             f"    reality-config:\n"
             f"      dest: {n['sni']}:443\n"
             f"      private-key: {n['priv']}\n"
@@ -1733,17 +1776,28 @@ def collect_ufw_specs(nodes: list, inbounds: list) -> set:
 
 
 def sync_ufw(old_specs: set, new_specs: set):
-    """When ufw is active, allow newly added node ports and delete removed node ports (including UDP)."""
-    rc, out = run([UFW_BIN, "status"])
-    if rc != 0 or "Status: active" not in out:
-        return
+    """When ufw or firewalld is active, allow newly added node ports and delete removed node ports (including UDP)."""
     env = read_env()
     cport = get_controller_port(env)
     protected = {"80/tcp", f"{env.get('PANEL_PORT') or 0}/tcp", f"{cport}/tcp"}
-    for spec in sorted(new_specs - old_specs):
-        run([UFW_BIN, "allow", spec])
-    for spec in sorted((old_specs - new_specs) - protected):
-        run([UFW_BIN, "delete", "allow", spec])
+    rc, out = run([UFW_BIN, "status"])
+    if rc == 0 and "Status: active" in out:
+        for spec in sorted(new_specs - old_specs):
+            run([UFW_BIN, "allow", spec])
+        for spec in sorted((old_specs - new_specs) - protected):
+            run([UFW_BIN, "delete", "allow", spec])
+        return
+    rc, _ = run([FIREWALL_CMD_BIN, "--state"])
+    if rc == 0:
+        changed = False
+        for spec in sorted(new_specs - old_specs):
+            run([FIREWALL_CMD_BIN, "--permanent", f"--add-port={spec}"])
+            changed = True
+        for spec in sorted((old_specs - new_specs) - protected):
+            run([FIREWALL_CMD_BIN, "--permanent", f"--remove-port={spec}"])
+            changed = True
+        if changed:
+            run([FIREWALL_CMD_BIN, "--reload"])
 
 
 def sync_client_files():
@@ -2093,11 +2147,18 @@ def reset_to_template_config():
 
 def reality_client(n: dict, env: dict) -> dict:
     """Client proxy for an install-time Reality node (same fields as core.sh proxy_line)."""
-    return {"name": f"{env.get('VPS_NAME', 'vps')}-{n['name']}|Clash|Reality", "type": "vless",
-            "server": env.get("SERVER_IP", ""), "port": n["port"], "uuid": n["uuid"], "tls": True,
-            "flow": "xtls-rprx-vision", "client-fingerprint": "safari", "skip-cert-verify": False,
-            "reality-opts": {"public-key": n["pub"], "short-id": n["sid"]}, "network": "tcp",
-            "udp": True, "servername": n["sni"]}
+    d = {
+        "name": f"{env.get('VPS_NAME', 'vps')}-{n['name']}|Clash|Reality", "type": "vless",
+        "server": env.get("SERVER_IP", ""), "port": n["port"], "uuid": n["uuid"], "tls": True,
+        "flow": "xtls-rprx-vision", "client-fingerprint": "safari", "skip-cert-verify": False,
+    }
+    if n.get("enc"):
+        d["encryption"] = n["enc"]
+    d.update({
+        "reality-opts": {"public-key": n["pub"], "short-id": n["sid"]}, "network": "tcp",
+        "udp": True, "servername": n["sni"],
+    })
+    return d
 
 
 def render_subscription(env: dict) -> str:
@@ -3201,18 +3262,19 @@ placeholder="请输入面板密码" required autofocus></div>
 <div><label for=port>监听端口</label><input id=port name=port inputmode=numeric placeholder="留空则随机分配空闲高端口"></div>
 <div><label for=nm>节点名称</label><input id=nm name=name placeholder="留空则自动生成（默认 VlessReality）"></div>
 
-<div data-kind=vless-reality><label>Reality 伪装域名（SNI）</label><input name=reality_sni placeholder="默认 www.sc.com"></div>
+<div data-kind=vless-reality><label>Reality 伪装域名（SNI）</label><input name=reality_sni placeholder="留空从 SNI 池随机抽取"></div>
+<div data-kind=vless-reality><label>VLESS Encryption（vless-x25519）</label><select name=reality_enc><option value=x25519>启用 mlkem768x25519plus（默认）</option><option value=none>不启用</option></select></div>
 <div data-kind=shadowsocks><label>Shadowsocks 加密方式</label><select name=ss_cipher>{ss_opts}</select></div>
 <div data-kind=hysteria2><label>Salamander 混淆密码（选填）</label><input name=hy2_obfs_pw placeholder="留空不启用 obfs"></div>
 <div data-kind=snell><label>Snell 版本</label><select name=snell_version><option value=5>v5（默认）</option><option value=4>v4</option></select></div>
 <div data-kind=snell><label>Snell 混淆模式</label><select name=snell_obfs><option value=tls>tls（默认）</option><option value=http>http</option></select></div>
-<div data-kind=snell><label>Snell 伪装 Host</label><input name=snell_host placeholder="默认 www.sc.com"></div>
+<div data-kind=snell><label>Snell 伪装 Host</label><input name=snell_host placeholder="留空从 SNI 池随机抽取"></div>
 <div data-kind=trusttunnel><label>TrustTunnel 用户名</label><input name=tt_user placeholder="默认 user"></div>
 <div data-kind=trusttunnel><label>拥塞控制算法</label><select name=tt_cc><option value=bbr>bbr（默认）</option><option value=cubic>cubic</option></select></div>
 
 <div data-kind=vless><label>VLESS 传输层</label><select name=vless_net><option value=tcp>TCP + Vision（默认）</option><option value=xhttp>XHTTP（推荐抗封锁）</option><option value=ws>WebSocket (WS)</option><option value=grpc>gRPC</option></select></div>
 <div data-kind=vless><label>VLESS TLS 证书</label><select name=vless_tls><option value=1>启用本机域名证书（默认）</option><option value=0>不启用 TLS（配合原生加密）</option></select></div>
-<div data-kind=vless><label>VLESS 原生加密（decryption）</label><select name=vless_enc><option value=none>不启用（默认）</option><option value=x25519>启用 mlkem768x25519plus</option></select></div>
+<div data-kind=vless><label>VLESS Encryption（vless-x25519）</label><select name=vless_enc><option value=x25519>启用 mlkem768x25519plus（默认）</option><option value=none>不启用</option></select></div>
 <div data-kind=vless><label>XHTTP / WS / gRPC 路径</label><input name=vless_path placeholder="留空自动生成随机路径"></div>
 
 <div data-kind=vmess><label>VMess 传输层</label><select name=vmess_net><option value=ws>WebSocket (WS，默认)</option><option value=tcp>TCP</option><option value=grpc>gRPC</option></select></div>

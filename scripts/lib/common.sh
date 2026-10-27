@@ -1,14 +1,14 @@
 # shellcheck shell=bash
 # clashserver 公共函数：常量、日志、交互、环境持久化、下载与安装文件、旧目录迁移
 
-CS_VERSION=0.55
+CS_VERSION=0.6
 REPO_TARBALL=https://github.com/saulsburyroy/clashserver/archive/refs/heads/main.tar.gz
 CS_ROOT=/etc/clashserve
 SELF_BIN=/usr/local/bin/clashserver
 BIN=$CS_ROOT/mihomo
 CONF_DIR=$CS_ROOT
 CONF=$CONF_DIR/config.yaml
-STATE=$CONF_DIR/nodes.tsv                    # name port uuid private pub shortid sni
+STATE=$CONF_DIR/nodes.tsv                    # name port uuid private pub shortid sni dec enc
 FRAG_CONTROLLER=$CONF_DIR/controller.yaml    # external-controller-tls + zashboard (cert modes)
 FRAG_REALITY=$CONF_DIR/listeners.reality.yaml
 FRAG_EXTRA=$CONF_DIR/listeners.extra.yaml    # owned by the panel
@@ -24,10 +24,22 @@ PANEL_CFG=$CS_ETC/panel.json
 ACME_HOME=$CS_ETC/acme.sh                    # acme.sh 安装目录（--home），账户与证书都在这里
 ACMESH_VERSION=3.1.6                         # 固定版本，避免上游参数变动
 REPO_API=https://api.github.com/repos/MetaCubeX/mihomo/releases/latest
-REALITY_SNI=www.sc.com
+REALITY_SNI_POOL=(
+  www.microsoft.com
+  www.apple.com
+  addons.mozilla.org
+  www.yahoo.com
+  www.amd.com
+  www.nvidia.com
+  www.samsung.com
+  www.cisco.com
+  www.oracle.com
+  www.lovelive-anime.jp
+)
 DOMAIN_RE='^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$'
 WILDCARD_DOMAIN_RE='^(\*\.)?([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$'
 
+PKG_MGR=""
 MODE=no-cert MODE_SET=0 NODES=1 VPS_NAME="" SERVER_IP=""   # NODES：默认生成 1 个 Reality 节点，更多节点在面板添加
 CERT_MODE=port CERT_MODE_SET=0 CF_TOKEN=""                 # CERT_MODE：port（端口模式）| dns（DNS API 模式）| manual（手动证书模式）
 DOMAIN="" EMAIL="" TLS=staging PANEL_PORT=""               # 默认 Let's Encrypt staging（仅自动申请）；面板端口随机选空闲高端口
@@ -55,11 +67,31 @@ ask() { # ask "提示" 默认值  -> 读取 /dev/tty（curl|bash 时 stdin 是�
   printf '%s' "${ans:-$2}"
 }
 
+detect_pkg_mgr() {
+  if command -v apt-get >/dev/null 2>&1; then
+    PKG_MGR=apt
+  elif command -v dnf >/dev/null 2>&1; then
+    PKG_MGR=dnf
+  elif command -v yum >/dev/null 2>&1; then
+    PKG_MGR=yum
+  else
+    PKG_MGR=""
+  fi
+}
+
 check_os() {
-  [[ -r /etc/os-release ]] || die "无法识别操作系统"
+  [[ "$(uname -s)" == Linux ]] || die "仅支持 Linux 系统（当前：$(uname -s)）"
+  [[ -r /etc/os-release ]] || die "无法识别操作系统（缺少 /etc/os-release）"
+  # shellcheck disable=SC1091
   . /etc/os-release
-  [[ "${ID:-}" == debian || "${ID_LIKE:-}" == *debian* ]] || die "仅支持 Debian 系统（当前：${ID:-未知}）"
-  command -v systemctl >/dev/null || die "需要 systemd"
+  local os_name="${PRETTY_NAME:-${ID:-未知}}"
+  command -v systemctl >/dev/null 2>&1 || die "不支持当前系统（$os_name）：需要 systemd 作为服务管理器"
+  detect_pkg_mgr
+  [[ -n $PKG_MGR ]] || die "不支持当前系统（$os_name）：需要支持 apt / dnf / yum 的主流服务端发行版（Ubuntu / Debian / Rocky / AlmaLinux / Fedora / CentOS 等）"
+}
+
+rand_sni() {
+  echo "${REALITY_SNI_POOL[$((RANDOM % ${#REALITY_SNI_POOL[@]}))]}"
 }
 
 arch() {

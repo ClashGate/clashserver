@@ -64,7 +64,7 @@ setup_panel() {
 panel_https_ok() { # 本机访问面板 HTTPS（跳过证书校验，只验证 HTTPS 通路）
   local h p
   h=$(panel_host); p=$(panel_port)
-  curl -fsSk --max-time 5 --resolve "$h:$p:127.0.0.1" "https://$h:$p$1" 2>/dev/null
+  curl -fsSk --max-time 10 --resolve "$h:$p:127.0.0.1" "https://$h:$p$1" 2>/dev/null
 }
 
 panel_cfg_get() { jq -r --arg k "$1" '.[$k] // empty' "$PANEL_CFG" 2>/dev/null || true; }
